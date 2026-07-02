@@ -4,6 +4,9 @@
 //! bottom-up from a raw file: [`disk`] → [`buffer`] → [`slotted`] → [`btree`].
 //! No third-party storage/btree/serialization crate is used — that is the point.
 
+pub mod encoding;
+pub mod page;
+
 use thiserror::Error;
 
 /// Every fallible storage operation returns this error.
