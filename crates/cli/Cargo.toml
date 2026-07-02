@@ -1,0 +1,15 @@
+[package]
+name = "ferrodb-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ferrodb-kv"
+path = "src/main.rs"
+
+[dependencies]
+storage = { path = "../storage" }
+rustyline = "14"
+
+[dev-dependencies]
+tempfile = "3"
