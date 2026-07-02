@@ -5,8 +5,36 @@ indexes, write-ahead logging with crash recovery, MVCC transactions, a cost-base
 planner, and the PostgreSQL wire protocol. No third-party SQL parser, storage engine, or
 B+-tree crate: the point is to build the machine, not glue one together.
 
-> **Status:** Milestone 1 (storage engine) complete and green. See the
-> [full design & roadmap](docs/superpowers/specs/2026-07-02-ferrodb-design.md).
+> **Status:** Milestones 1–2 complete and green — it runs real SQL, persisted to
+> disk. See the [full design & roadmap](docs/superpowers/specs/2026-07-02-ferrodb-design.md).
+
+## Milestone 2 — SQL ✅
+
+```sql
+CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);
+INSERT INTO users VALUES (1, 'alejandro', 30), (2, 'sam', 25), (3, 'kai', 40);
+SELECT name, age FROM users WHERE age > 26 ORDER BY name;
+```
+```
++-----------+-----+
+| name      | age |
++-----------+-----+
+| alejandro | 30  |
+| kai       | 40  |
++-----------+-----+
+```
+
+A hand-written **lexer + Pratt/recursive-descent parser** (no `sqlparser` crate) →
+AST → binder → a **volcano-style executor** over the M1 B+-trees. Supports
+`CREATE TABLE`/`DROP TABLE`, `INSERT`, `SELECT` (projection, `WHERE`, `ORDER BY`,
+`LIMIT`/`OFFSET`), `UPDATE`, `DELETE`; four types with three-valued `NULL` logic;
+per-table B+-trees keyed by primary key (or a hidden row id); a self-describing
+catalog stored in-file. Run it with the `ferrodb` shell:
+
+```console
+$ cargo run -p ferrodb-cli --bin ferrodb -- mydata.db
+sql> SELECT * FROM users ORDER BY age DESC LIMIT 2;
+```
 
 ---
 
@@ -55,7 +83,7 @@ Built bottom-up; each milestone is an independently testable, demoable artifact.
 | # | Milestone | Headline |
 |---|-----------|----------|
 | **M1** | **Storage engine** ✅ | pager · buffer pool · B+-tree · overflow · durability |
-| M2 | SQL frontend + executor | lexer → Pratt parser → binder → volcano executor |
+| **M2** | **SQL frontend + executor** ✅ | lexer → Pratt parser → binder → volcano executor |
 | M3 | WAL + crash recovery | `kill -9` mid-write, restart, data intact |
 | M4 | MVCC transactions | snapshot isolation · `BEGIN`/`COMMIT`/`ROLLBACK` · `VACUUM` |
 | M5 | Cost-based optimizer | statistics · join ordering · index selection · `EXPLAIN` |
@@ -67,7 +95,9 @@ Built bottom-up; each milestone is an independently testable, demoable artifact.
 
 ```
 crates/storage   disk · buffer pool · slotted pages · B+-tree · (later) WAL, recovery
-crates/cli       ferrodb-kv REPL
+crates/sql       lexer · Pratt parser · AST
+crates/engine    catalog · tuple codec · evaluator · executor · Database/execute
+crates/cli       ferrodb-kv (raw KV) + ferrodb (SQL shell)
 docs/            design spec + implementation plans
 ```
 
