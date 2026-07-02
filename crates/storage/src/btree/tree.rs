@@ -12,7 +12,8 @@ use crate::{Result, StorageError};
 
 pub struct BPlusTree<'a> {
     bp: &'a mut BufferPool,
-    meta: &'a mut MetaPage,
+    root: PageId,
+    meta: Option<&'a mut MetaPage>,
 }
 
 /// A split bubbling up to the parent: `(separator_key, new_right_page)`.
@@ -35,19 +36,60 @@ pub fn load_meta(bp: &mut BufferPool) -> Result<MetaPage> {
 
 impl<'a> BPlusTree<'a> {
     pub fn open(bp: &'a mut BufferPool, meta: &'a mut MetaPage) -> Self {
-        let t = BPlusTree { bp, meta };
-        if t.meta.tree_root.is_none() {
-            if t.bp.disk_mut().num_pages() == 0 {
-                t.bp.disk_mut().allocate_page().unwrap(); // reserve page 0 for meta
+        if meta.tree_root.is_none() {
+            if bp.disk_mut().num_pages() == 0 {
+                bp.disk_mut().allocate_page().unwrap(); // reserve page 0 for meta
             }
-            let id = t.bp.disk_mut().allocate_page().unwrap();
-            let f = t.bp.new_page(id).unwrap();
-            node::init_leaf(t.bp.frame_mut(f), None);
-            t.bp.mark_dirty(f);
-            t.bp.unpin(f);
-            t.meta.tree_root = Some(id);
+            let id = bp.disk_mut().allocate_page().unwrap();
+            let f = bp.new_page(id).unwrap();
+            node::init_leaf(bp.frame_mut(f), None);
+            bp.mark_dirty(f);
+            bp.unpin(f);
+            meta.tree_root = Some(id);
         }
-        t
+        let root = meta.tree_root.unwrap();
+        BPlusTree {
+            bp,
+            root,
+            meta: Some(meta),
+        }
+    }
+
+    /// Create a brand-new empty tree. Read its root page via [`BPlusTree::root`]
+    /// and persist it yourself (e.g. in a catalog). Used for per-table trees.
+    pub fn create(bp: &'a mut BufferPool) -> Result<Self> {
+        let id = bp.disk_mut().allocate_page()?;
+        let f = bp.new_page(id)?;
+        node::init_leaf(bp.frame_mut(f), None);
+        bp.mark_dirty(f);
+        bp.unpin(f);
+        Ok(BPlusTree {
+            bp,
+            root: id,
+            meta: None,
+        })
+    }
+
+    /// Open an existing tree rooted at `root`. The root may change after an
+    /// insert grows the tree — read it back with [`BPlusTree::root`].
+    pub fn open_at(bp: &'a mut BufferPool, root: PageId) -> Self {
+        BPlusTree {
+            bp,
+            root,
+            meta: None,
+        }
+    }
+
+    /// The tree's current root page id (changes when the root splits).
+    pub fn root(&self) -> PageId {
+        self.root
+    }
+
+    fn set_root(&mut self, r: PageId) {
+        self.root = r;
+        if let Some(m) = self.meta.as_deref_mut() {
+            m.tree_root = Some(r);
+        }
     }
 
     // ---- value inline/overflow codec -------------------------------------
@@ -85,7 +127,7 @@ impl<'a> BPlusTree<'a> {
     // ---- point lookup -----------------------------------------------------
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let mut pid = self.meta.tree_root.unwrap();
+        let mut pid = self.root;
         loop {
             let f = self.bp.fetch(pid)?;
             let page = self.bp.frame(f).clone();
@@ -108,7 +150,7 @@ impl<'a> BPlusTree<'a> {
 
     pub fn insert(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
         let encoded = self.encode_value(val)?;
-        let root = self.meta.tree_root.unwrap();
+        let root = self.root;
         if let Some((sep, right)) = self.insert_rec(root, key, &encoded)? {
             let id = self.bp.disk_mut().allocate_page()?;
             let f = self.bp.new_page(id)?;
@@ -116,7 +158,7 @@ impl<'a> BPlusTree<'a> {
             node::internal_put(self.bp.frame_mut(f), &sep, right)?;
             self.bp.mark_dirty(f);
             self.bp.unpin(f);
-            self.meta.tree_root = Some(id);
+            self.set_root(id);
         }
         Ok(())
     }
@@ -245,7 +287,7 @@ impl<'a> BPlusTree<'a> {
     // ---- range scan -------------------------------------------------------
 
     fn leftmost_leaf_for(&mut self, lo: Option<&[u8]>) -> Result<PageId> {
-        let mut pid = self.meta.tree_root.unwrap();
+        let mut pid = self.root;
         loop {
             let f = self.bp.fetch(pid)?;
             let page = self.bp.frame(f).clone();
@@ -301,7 +343,7 @@ impl<'a> BPlusTree<'a> {
     /// Remove `key` from its leaf. Returns whether it existed. M1 does not merge
     /// under-full nodes (that lands with M4 `VACUUM`); the tree stays valid.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
-        let mut pid = self.meta.tree_root.unwrap();
+        let mut pid = self.root;
         loop {
             let f = self.bp.fetch(pid)?;
             let kind = node::read_kind(self.bp.frame(f));
@@ -329,8 +371,10 @@ impl<'a> BPlusTree<'a> {
     /// Flush all dirty pages and write the current meta record to page 0.
     pub fn checkpoint(&mut self) -> Result<()> {
         self.bp.flush_all()?;
-        let mut meta_page = self.meta.encode();
-        self.bp.disk_mut().write_page(PageId(0), &mut meta_page)?;
+        if let Some(m) = self.meta.as_deref() {
+            let mut meta_page = m.encode();
+            self.bp.disk_mut().write_page(PageId(0), &mut meta_page)?;
+        }
         self.bp.disk_mut().sync()
     }
 }
