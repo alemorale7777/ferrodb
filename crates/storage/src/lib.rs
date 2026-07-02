@@ -4,11 +4,13 @@
 //! bottom-up from a raw file: [`disk`] → [`buffer`] → [`slotted`] → [`btree`].
 //! No third-party storage/btree/serialization crate is used — that is the point.
 
+pub mod buffer;
 pub mod disk;
 pub mod encoding;
 pub mod freelist;
 pub mod meta;
 pub mod page;
+pub mod slotted;
 
 use thiserror::Error;
 
