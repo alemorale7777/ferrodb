@@ -4,6 +4,7 @@
 //! bottom-up from a raw file: [`disk`] → [`buffer`] → [`slotted`] → [`btree`].
 //! No third-party storage/btree/serialization crate is used — that is the point.
 
+pub mod btree;
 pub mod buffer;
 pub mod disk;
 pub mod encoding;
