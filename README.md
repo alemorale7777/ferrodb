@@ -5,8 +5,21 @@ indexes, write-ahead logging with crash recovery, MVCC transactions, a cost-base
 planner, and the PostgreSQL wire protocol. No third-party SQL parser, storage engine, or
 B+-tree crate: the point is to build the machine, not glue one together.
 
-> **Status:** Milestones 1–2 complete and green — it runs real SQL, persisted to
-> disk. See the [full design & roadmap](docs/superpowers/specs/2026-07-02-ferrodb-design.md).
+> **Status:** Milestones 1–3 complete and green — it runs real SQL, persisted to
+> disk, and survives a crash. See the
+> [full design & roadmap](docs/superpowers/specs/2026-07-02-ferrodb-design.md).
+
+## Milestone 3 — WAL + crash recovery ✅
+
+Every statement is an autocommit transaction backed by a **write-ahead log**. The buffer pool
+is **no-steal** (uncommitted pages never reach the data file), so recovery is redo-only: on
+commit we log the modified pages' after-images and `fsync` the WAL *before* touching the data
+file; on startup we replay any committed-but-unflushed transaction and discard incomplete ones.
+
+The upshot: a crash **between the WAL commit and the data flush** — the exact window that
+otherwise corrupts a multi-page B+-tree split — is repaired on restart, and a statement that
+never committed leaves **no trace**. Both guarantees are proven by deterministic crash-injection
+tests (`crates/engine/src/lib.rs` → `crash_tests`), not by racing an OS `kill`.
 
 ## Milestone 2 — SQL ✅
 
@@ -84,7 +97,7 @@ Built bottom-up; each milestone is an independently testable, demoable artifact.
 |---|-----------|----------|
 | **M1** | **Storage engine** ✅ | pager · buffer pool · B+-tree · overflow · durability |
 | **M2** | **SQL frontend + executor** ✅ | lexer → Pratt parser → binder → volcano executor |
-| M3 | WAL + crash recovery | `kill -9` mid-write, restart, data intact |
+| **M3** | **WAL + crash recovery** ✅ | no-steal redo log; crash mid-write, restart, data intact |
 | M4 | MVCC transactions | snapshot isolation · `BEGIN`/`COMMIT`/`ROLLBACK` · `VACUUM` |
 | M5 | Cost-based optimizer | statistics · join ordering · index selection · `EXPLAIN` |
 | M6 | PostgreSQL wire protocol | connect with real `psql` |
@@ -94,7 +107,7 @@ Built bottom-up; each milestone is an independently testable, demoable artifact.
 ## Layout
 
 ```
-crates/storage   disk · buffer pool · slotted pages · B+-tree · (later) WAL, recovery
+crates/storage   disk · buffer pool · slotted pages · B+-tree · WAL + recovery
 crates/sql       lexer · Pratt parser · AST
 crates/engine    catalog · tuple codec · evaluator · executor · Database/execute
 crates/cli       ferrodb-kv (raw KV) + ferrodb (SQL shell)
