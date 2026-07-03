@@ -12,6 +12,7 @@ pub mod freelist;
 pub mod meta;
 pub mod page;
 pub mod slotted;
+pub mod wal;
 
 use thiserror::Error;
 

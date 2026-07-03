@@ -23,6 +23,7 @@ pub struct BufferPool {
     table: HashMap<PageId, usize>,
     capacity: usize,
     clock: usize,
+    no_steal: bool,
 }
 
 impl BufferPool {
@@ -33,7 +34,43 @@ impl BufferPool {
             table: HashMap::new(),
             capacity,
             clock: 0,
+            no_steal: false,
         }
+    }
+
+    /// In no-steal mode, dirty pages are never evicted (written to disk) — the
+    /// transaction layer flushes them explicitly at commit. Enables WAL recovery.
+    pub fn set_no_steal(&mut self, v: bool) {
+        self.no_steal = v;
+    }
+
+    /// Whether any frame currently holds unflushed changes.
+    pub fn has_dirty(&self) -> bool {
+        self.frames.iter().any(|f| f.dirty)
+    }
+
+    /// Clone the current image + id of every dirty frame (for WAL logging).
+    pub fn dirty_frames(&self) -> Vec<(PageId, Page)> {
+        self.frames
+            .iter()
+            .filter(|f| f.dirty)
+            .map(|f| (f.id, f.page.clone()))
+            .collect()
+    }
+
+    /// Drop all uncommitted changes: reload each dirty frame's committed image
+    /// from disk and clear its dirty flag. Used to roll back an aborted statement.
+    pub fn discard_dirty(&mut self) -> Result<()> {
+        let dm = &mut self.dm;
+        for f in &mut self.frames {
+            if f.dirty {
+                if f.id.0 < dm.num_pages() {
+                    f.page = dm.read_page(f.id)?;
+                }
+                f.dirty = false;
+            }
+        }
+        Ok(())
     }
 
     pub fn disk_mut(&mut self) -> &mut DiskManager {
@@ -73,6 +110,9 @@ impl BufferPool {
             self.clock = (self.clock + 1) % n;
             if self.frames[i].pins > 0 {
                 continue;
+            }
+            if self.no_steal && self.frames[i].dirty {
+                continue; // never steal an uncommitted dirty page
             }
             if self.frames[i].ref_bit {
                 self.frames[i].ref_bit = false;

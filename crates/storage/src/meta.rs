@@ -6,6 +6,7 @@ use crate::{Result, StorageError};
 const NIL: u32 = u32::MAX;
 
 /// Contents of page 0: identifies the file and points at the free list and B+-tree root.
+#[derive(Clone, Copy, Debug)]
 pub struct MetaPage {
     pub magic: u32,
     pub version: u16,
