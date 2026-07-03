@@ -7,6 +7,7 @@ pub mod eval;
 pub mod tuple;
 
 use std::cmp::Ordering;
+use std::path::PathBuf;
 
 use sql::ast::{DataType, Expr, SelectItem, Statement, Value};
 
@@ -17,6 +18,7 @@ use storage::buffer::BufferPool;
 use storage::disk::DiskManager;
 use storage::meta::MetaPage;
 use storage::page::PageId;
+use storage::wal::Wal;
 
 use catalog::{ColumnInfo, TableSchema};
 
@@ -55,18 +57,35 @@ pub enum Output {
     Ack(&'static str),
 }
 
-/// A single-file SQL database.
+/// A single-file SQL database with write-ahead logging for crash recovery.
 pub struct Database {
     bp: BufferPool,
     meta: MetaPage,
+    wal: Wal,
+    next_txn: u64,
 }
 
 impl Database {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Database, EngineError> {
-        let dm = DiskManager::open(path)?;
+        let data_path = path.as_ref();
+        let mut wal_name = data_path.as_os_str().to_owned();
+        wal_name.push(".wal");
+        let wal_path = PathBuf::from(wal_name);
+
+        // Recover any committed-but-unflushed work before reading the catalog.
+        let mut dm = DiskManager::open(data_path)?;
+        let mut wal = Wal::open(&wal_path)?;
+        wal.recover(&mut dm)?;
+
         let mut bp = BufferPool::new(dm, 256);
+        bp.set_no_steal(true); // WAL recovery requires no-steal
         let meta = load_meta(&mut bp)?;
-        Ok(Database { bp, meta })
+        Ok(Database {
+            bp,
+            meta,
+            wal,
+            next_txn: 1,
+        })
     }
 
     /// Flush all pages and persist the meta record. Call before dropping.
@@ -78,9 +97,59 @@ impl Database {
         Ok(())
     }
 
-    /// Parse and execute a single SQL statement.
+    /// Parse and execute a single SQL statement as its own autocommit transaction.
+    /// On success the statement is durable (WAL + data flushed); on error it is
+    /// rolled back entirely, leaving the database at its prior committed state.
     pub fn execute(&mut self, sql: &str) -> Result<Output, EngineError> {
         let stmt = sql::parse(sql)?;
+        let saved = self.meta; // MetaPage: Copy — statement-start snapshot for rollback
+        let txn = self.next_txn;
+        self.next_txn += 1;
+        match self.dispatch(stmt) {
+            Ok(out) => {
+                // Read-only statements dirty nothing — skip the commit fsync.
+                if self.bp.has_dirty() {
+                    self.commit(txn)?;
+                }
+                Ok(out)
+            }
+            Err(e) => {
+                self.meta = saved;
+                self.bp.discard_dirty()?;
+                Err(e)
+            }
+        }
+    }
+
+    fn commit(&mut self, txn: u64) -> Result<(), EngineError> {
+        self.wal_commit(txn)?;
+        self.force_data()
+    }
+
+    /// Log the transaction's dirty pages + meta, then a commit record, then fsync.
+    fn wal_commit(&mut self, txn: u64) -> Result<(), EngineError> {
+        for (pid, page) in self.bp.dirty_frames() {
+            self.wal.append_update(txn, pid, &page)?;
+        }
+        let meta_page = self.meta.encode();
+        self.wal.append_update(txn, PageId(0), &meta_page)?;
+        self.wal.append_commit(txn)?;
+        self.wal.sync()?;
+        Ok(())
+    }
+
+    /// Force dirty data pages + meta to the data file, then clear the WAL.
+    fn force_data(&mut self) -> Result<(), EngineError> {
+        self.bp.flush_all()?;
+        let mut mp = self.meta.encode();
+        self.bp.disk_mut().write_page(PageId(0), &mut mp)?;
+        self.bp.disk_mut().sync()?;
+        self.wal.reset()?;
+        Ok(())
+    }
+
+    /// Execute a parsed statement, mutating in-memory state without committing.
+    fn dispatch(&mut self, stmt: Statement) -> Result<Output, EngineError> {
         match stmt {
             Statement::CreateTable { name, columns } => self.exec_create(name, columns),
             Statement::DropTable { name } => self.exec_drop(name),
@@ -495,5 +564,73 @@ fn value_cmp(a: &Value, b: &Value) -> Ordering {
             (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
             _ => Ordering::Equal,
         },
+    }
+}
+
+#[cfg(test)]
+mod crash_tests {
+    //! Deterministic crash simulations that drive the WAL recovery path directly,
+    //! rather than racing an OS `kill` (reliable in CI).
+    use super::*;
+
+    fn tmp_path() -> std::path::PathBuf {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("crash.db");
+        std::mem::forget(dir); // keep the file alive for the whole test
+        p
+    }
+
+    fn select_vs(db: &mut Database) -> Vec<i64> {
+        match db.execute("SELECT v FROM t ORDER BY id").unwrap() {
+            Output::Rows { rows, .. } => rows
+                .into_iter()
+                .map(|r| match r[0] {
+                    Value::Integer(x) => x,
+                    _ => panic!(),
+                })
+                .collect(),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn redo_recovers_a_committed_txn_after_crash_before_data_flush() {
+        let path = tmp_path();
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+                .unwrap();
+            db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+            // Crash *after* the WAL commit is durable but *before* data is flushed:
+            // log + commit to the WAL, then drop without force_data(). No-steal means
+            // the dirty buffer pages never reached disk, so only the WAL has the change.
+            let txn = db.next_txn;
+            db.next_txn += 1;
+            let stmt = sql::parse("INSERT INTO t VALUES (2, 20)").unwrap();
+            db.dispatch(stmt).unwrap();
+            db.wal_commit(txn).unwrap();
+        }
+        {
+            let mut db = Database::open(&path).unwrap(); // recovery replays the WAL
+            assert_eq!(select_vs(&mut db), vec![10, 20]);
+        }
+    }
+
+    #[test]
+    fn an_uncommitted_txn_leaves_no_trace_after_crash() {
+        let path = tmp_path();
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+                .unwrap();
+            db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+            // Mutate a statement but never write its commit to the WAL, then crash.
+            let stmt = sql::parse("INSERT INTO t VALUES (2, 20)").unwrap();
+            db.dispatch(stmt).unwrap();
+        }
+        {
+            let mut db = Database::open(&path).unwrap();
+            assert_eq!(select_vs(&mut db), vec![10]); // row 2 is gone; row 1 intact
+        }
     }
 }
