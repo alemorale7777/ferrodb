@@ -1,9 +1,10 @@
 //! `ferrodb` — an interactive SQL shell over the ferrodb engine.
 //!
-//! Type SQL statements (optionally `;`-terminated). Dot-commands: `.tables`,
-//! `.checkpoint`, `.exit`.
+//! Type SQL statements (optionally `;`-terminated). Transactions: `BEGIN`,
+//! `COMMIT`, `ROLLBACK`. Dot-commands: `.tables`, `.vacuum`, `.checkpoint`,
+//! `.exit`.
 
-use engine::{Database, Output, SqlValue as Value};
+use engine::{Database, Output, SqlValue as Value, TxnId};
 use rustyline::DefaultEditor;
 
 fn render_value(v: &Value) -> String {
@@ -54,11 +55,22 @@ fn print_table(columns: &[String], rows: &[Vec<Value>]) {
     );
 }
 
-fn run_line(db: &mut Database, line: &str) {
-    match db.execute(line) {
-        Ok(Output::Rows { columns, rows }) => print_table(&columns, &rows),
-        Ok(Output::Affected(n)) => println!("{n} row{} affected", if n == 1 { "" } else { "s" }),
-        Ok(Output::Ack(msg)) => println!("{msg}"),
+fn print_output(out: Output) {
+    match out {
+        Output::Rows { columns, rows } => print_table(&columns, &rows),
+        Output::Affected(n) => println!("{n} row{} affected", if n == 1 { "" } else { "s" }),
+        Output::Ack(msg) => println!("{msg}"),
+    }
+}
+
+/// Run one SQL statement, inside the open transaction if there is one.
+fn run_line(db: &mut Database, txn: Option<TxnId>, line: &str) {
+    let result = match txn {
+        Some(t) => db.execute_in(t, line),
+        None => db.execute(line),
+    };
+    match result {
+        Ok(out) => print_output(out),
         Err(e) => eprintln!("Error: {e}"),
     }
 }
@@ -69,21 +81,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "ferrodb.db".into());
     let mut db = Database::open(&path)?;
     let mut rl = DefaultEditor::new()?;
+    let mut txn: Option<TxnId> = None;
     println!("ferrodb SQL shell — {path}");
-    println!("Enter SQL, or .tables / .checkpoint / .exit");
-    while let Ok(line) = rl.readline("sql> ") {
+    println!("Enter SQL, BEGIN/COMMIT/ROLLBACK, or .tables / .vacuum / .checkpoint / .exit");
+    while let Ok(line) = rl.readline(if txn.is_some() { "sql*> " } else { "sql> " }) {
         let trimmed = line.trim().trim_end_matches(';').trim();
         if trimmed.is_empty() {
             continue;
         }
         let _ = rl.add_history_entry(line.as_str());
-        match trimmed {
-            ".exit" => break,
-            ".checkpoint" => match db.checkpoint() {
+        match trimmed.to_ascii_uppercase().as_str() {
+            ".EXIT" => break,
+            "BEGIN" => {
+                if txn.is_some() {
+                    eprintln!("Error: a transaction is already open");
+                } else {
+                    txn = Some(db.begin());
+                    println!("BEGIN");
+                }
+            }
+            "COMMIT" => match txn.take() {
+                Some(t) => match db.commit_txn(t) {
+                    Ok(()) => println!("COMMIT"),
+                    Err(e) => eprintln!("Error: {e}"),
+                },
+                None => eprintln!("Error: no transaction open"),
+            },
+            "ROLLBACK" => match txn.take() {
+                Some(t) => match db.rollback_txn(t) {
+                    Ok(()) => println!("ROLLBACK"),
+                    Err(e) => eprintln!("Error: {e}"),
+                },
+                None => eprintln!("Error: no transaction open"),
+            },
+            ".VACUUM" => match db.vacuum() {
+                Ok(out) => print_output(out),
+                Err(e) => eprintln!("Error: {e}"),
+            },
+            ".CHECKPOINT" => match db.checkpoint() {
                 Ok(()) => println!("ok"),
                 Err(e) => eprintln!("Error: {e}"),
             },
-            ".tables" => match db.list_tables() {
+            ".TABLES" => match db.list_tables() {
                 Ok(names) => {
                     for n in names {
                         println!("{n}");
@@ -91,8 +130,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(e) => eprintln!("Error: {e}"),
             },
-            sql => run_line(&mut db, sql),
+            _ => run_line(&mut db, txn, trimmed),
         }
+    }
+    if let Some(t) = txn.take() {
+        db.rollback_txn(t)?;
     }
     db.checkpoint()?;
     Ok(())
