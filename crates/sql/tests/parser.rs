@@ -2,7 +2,13 @@ use sql::ast::*;
 use sql::{parse, SqlError};
 
 fn col(name: &str) -> Expr {
-    Expr::Column(name.into())
+    Expr::col(name)
+}
+fn qcol(table: &str, name: &str) -> Expr {
+    Expr::Column {
+        table: Some(table.into()),
+        name: name.into(),
+    }
 }
 fn int(n: i64) -> Expr {
     Expr::Literal(Value::Integer(n))
@@ -12,6 +18,24 @@ fn bin(op: BinOp, l: Expr, r: Expr) -> Expr {
         op,
         left: Box::new(l),
         right: Box::new(r),
+    }
+}
+fn item(e: Expr) -> SelectItem {
+    SelectItem::Expr {
+        expr: e,
+        alias: None,
+    }
+}
+fn tref(name: &str) -> TableRef {
+    TableRef {
+        name: name.into(),
+        alias: None,
+    }
+}
+fn as_select(s: Statement) -> Select {
+    match s {
+        Statement::Select(sel) => sel,
+        other => panic!("not a select: {other:?}"),
     }
 }
 
@@ -65,58 +89,152 @@ fn parses_multi_row_insert() {
 
 #[test]
 fn parses_select_with_where_order_limit() {
-    let s =
+    let sel = as_select(
         parse("SELECT name, age FROM users WHERE age > 26 ORDER BY name DESC LIMIT 10 OFFSET 5")
-            .unwrap();
-    let Statement::Select {
-        items,
-        from,
-        filter,
-        order_by,
-        limit,
-        offset,
-    } = s
-    else {
-        panic!("not a select");
-    };
-    assert_eq!(
-        items,
-        vec![
-            SelectItem::Column("name".into()),
-            SelectItem::Column("age".into())
-        ]
+            .unwrap(),
     );
-    assert_eq!(from, "users");
-    assert_eq!(filter, Some(bin(BinOp::Gt, col("age"), int(26))));
+    assert_eq!(sel.items, vec![item(col("name")), item(col("age"))]);
+    assert_eq!(sel.from, tref("users"));
+    assert!(sel.joins.is_empty());
+    assert_eq!(sel.filter, Some(bin(BinOp::Gt, col("age"), int(26))));
     assert_eq!(
-        order_by,
-        Some(OrderBy {
-            column: "name".into(),
+        sel.order_by,
+        vec![OrderBy {
+            expr: col("name"),
             descending: true
-        })
+        }]
     );
-    assert_eq!(limit, Some(10));
-    assert_eq!(offset, Some(5));
+    assert_eq!(sel.limit, Some(10));
+    assert_eq!(sel.offset, Some(5));
 }
 
 #[test]
 fn select_star() {
-    let s = parse("SELECT * FROM t").unwrap();
-    let Statement::Select { items, .. } = s else {
-        panic!()
+    let sel = as_select(parse("SELECT * FROM t").unwrap());
+    assert_eq!(sel.items, vec![SelectItem::Wildcard]);
+}
+
+#[test]
+fn qualified_columns_and_aliases_and_inner_join() {
+    let sel = as_select(
+        parse("SELECT u.name, o.total FROM users u JOIN orders AS o ON u.id = o.user_id").unwrap(),
+    );
+    assert_eq!(
+        sel.items,
+        vec![item(qcol("u", "name")), item(qcol("o", "total"))]
+    );
+    assert_eq!(
+        sel.from,
+        TableRef {
+            name: "users".into(),
+            alias: Some("u".into())
+        }
+    );
+    assert_eq!(sel.joins.len(), 1);
+    let j = &sel.joins[0];
+    assert_eq!(j.join_type, JoinType::Inner);
+    assert_eq!(
+        j.right,
+        TableRef {
+            name: "orders".into(),
+            alias: Some("o".into())
+        }
+    );
+    assert_eq!(j.on, bin(BinOp::Eq, qcol("u", "id"), qcol("o", "user_id")));
+}
+
+#[test]
+fn left_outer_join_is_left() {
+    let sel = as_select(parse("SELECT * FROM a LEFT OUTER JOIN b ON a.k = b.k").unwrap());
+    assert_eq!(sel.joins[0].join_type, JoinType::Left);
+}
+
+#[test]
+fn projection_alias_with_as_and_bare() {
+    let sel = as_select(parse("SELECT age AS years, name handle FROM t").unwrap());
+    assert_eq!(
+        sel.items,
+        vec![
+            SelectItem::Expr {
+                expr: col("age"),
+                alias: Some("years".into())
+            },
+            SelectItem::Expr {
+                expr: col("name"),
+                alias: Some("handle".into())
+            },
+        ]
+    );
+}
+
+#[test]
+fn aggregates_group_by_having() {
+    let sel = as_select(
+        parse("SELECT dept, COUNT(*), SUM(salary) FROM emp GROUP BY dept HAVING COUNT(*) > 2")
+            .unwrap(),
+    );
+    assert_eq!(
+        sel.items,
+        vec![
+            item(col("dept")),
+            item(Expr::Aggregate {
+                func: AggFunc::Count,
+                arg: None
+            }),
+            item(Expr::Aggregate {
+                func: AggFunc::Sum,
+                arg: Some(Box::new(col("salary")))
+            }),
+        ]
+    );
+    assert_eq!(sel.group_by, vec![col("dept")]);
+    assert_eq!(
+        sel.having,
+        Some(bin(
+            BinOp::Gt,
+            Expr::Aggregate {
+                func: AggFunc::Count,
+                arg: None
+            },
+            int(2)
+        ))
+    );
+}
+
+#[test]
+fn qualified_wildcard_and_multi_key_order() {
+    let sel = as_select(parse("SELECT t.* FROM t ORDER BY a ASC, b DESC").unwrap());
+    assert_eq!(sel.items, vec![SelectItem::QualifiedWildcard("t".into())]);
+    assert_eq!(
+        sel.order_by,
+        vec![
+            OrderBy {
+                expr: col("a"),
+                descending: false
+            },
+            OrderBy {
+                expr: col("b"),
+                descending: true
+            },
+        ]
+    );
+}
+
+#[test]
+fn explain_wraps_a_select() {
+    let s = parse("EXPLAIN SELECT * FROM t WHERE id = 1").unwrap();
+    let Statement::Explain(inner) = s else {
+        panic!("not explain");
     };
-    assert_eq!(items, vec![SelectItem::Wildcard]);
+    let sel = as_select(*inner);
+    assert_eq!(sel.filter, Some(bin(BinOp::Eq, col("id"), int(1))));
 }
 
 #[test]
 fn and_binds_tighter_than_or() {
-    // a OR b AND c  ==  a OR (b AND c)
-    let s = parse("SELECT * FROM t WHERE a OR b AND c").unwrap();
-    let Statement::Select { filter, .. } = s else {
-        panic!()
-    };
+    let sel = as_select(parse("SELECT * FROM t WHERE a OR b AND c").unwrap());
     assert_eq!(
-        filter,
+        sel.filter,
         Some(bin(
             BinOp::Or,
             col("a"),
@@ -127,13 +245,9 @@ fn and_binds_tighter_than_or() {
 
 #[test]
 fn comparison_binds_tighter_than_not() {
-    // NOT a = b  ==  NOT (a = b)
-    let s = parse("SELECT * FROM t WHERE NOT a = b").unwrap();
-    let Statement::Select { filter, .. } = s else {
-        panic!()
-    };
+    let sel = as_select(parse("SELECT * FROM t WHERE NOT a = b").unwrap());
     assert_eq!(
-        filter,
+        sel.filter,
         Some(Expr::Unary {
             op: UnOp::Not,
             expr: Box::new(bin(BinOp::Eq, col("a"), col("b"))),
@@ -143,13 +257,9 @@ fn comparison_binds_tighter_than_not() {
 
 #[test]
 fn arithmetic_precedence() {
-    // 1 + 2 * 3  ==  1 + (2 * 3)
-    let s = parse("SELECT * FROM t WHERE x = 1 + 2 * 3").unwrap();
-    let Statement::Select { filter, .. } = s else {
-        panic!()
-    };
+    let sel = as_select(parse("SELECT * FROM t WHERE x = 1 + 2 * 3").unwrap());
     assert_eq!(
-        filter,
+        sel.filter,
         Some(bin(
             BinOp::Eq,
             col("x"),
@@ -160,24 +270,18 @@ fn arithmetic_precedence() {
 
 #[test]
 fn is_null_and_is_not_null() {
-    let s = parse("SELECT * FROM t WHERE a IS NULL").unwrap();
-    let Statement::Select { filter, .. } = s else {
-        panic!()
-    };
+    let sel = as_select(parse("SELECT * FROM t WHERE a IS NULL").unwrap());
     assert_eq!(
-        filter,
+        sel.filter,
         Some(Expr::IsNull {
             expr: Box::new(col("a")),
             negated: false
         })
     );
 
-    let s = parse("SELECT * FROM t WHERE a IS NOT NULL").unwrap();
-    let Statement::Select { filter, .. } = s else {
-        panic!()
-    };
+    let sel = as_select(parse("SELECT * FROM t WHERE a IS NOT NULL").unwrap());
     assert_eq!(
-        filter,
+        sel.filter,
         Some(Expr::IsNull {
             expr: Box::new(col("a")),
             negated: true
@@ -213,8 +317,9 @@ fn parses_update_and_delete_and_drop() {
 #[test]
 fn trailing_semicolon_ok_and_garbage_rejected() {
     assert!(parse("SELECT * FROM t;").is_ok());
+    // a number after the table ref is neither an alias nor a clause keyword
     assert!(matches!(
-        parse("SELECT * FROM t GARBAGE"),
+        parse("SELECT * FROM t 123"),
         Err(SqlError::Parse(_))
     ));
     assert!(matches!(parse("SELECT FROM"), Err(SqlError::Parse(_))));

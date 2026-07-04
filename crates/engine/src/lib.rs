@@ -8,14 +8,15 @@
 pub mod catalog;
 pub mod eval;
 pub mod mvcc;
+pub mod plan;
+pub mod planner;
 pub mod tuple;
 pub mod txn;
 
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use sql::ast::{DataType, Expr, SelectItem, Statement, Value};
+use sql::ast::{DataType, Expr, Select, SelectItem, Statement, TableRef, Value};
 use storage::btree::tree::{load_meta, BPlusTree};
 use storage::buffer::BufferPool;
 use storage::disk::DiskManager;
@@ -25,7 +26,8 @@ use storage::wal::Wal;
 
 use catalog::{ColumnInfo, TableSchema};
 use mvcc::Version;
-use txn::{Status, TxnManager};
+use plan::{Access, Col, Plan, RowSet};
+use txn::{Snapshot, Status, TxnManager};
 
 /// A row key paired with its decoded version chain.
 type KeyedChain = (Vec<u8>, Vec<Version>);
@@ -327,20 +329,17 @@ impl Database {
                 columns,
                 rows,
             } => self.exec_insert(txn, table, columns, rows),
-            Statement::Select {
-                items,
-                from,
-                filter,
-                order_by,
-                limit,
-                offset,
-            } => self.exec_select(txn, items, from, filter, order_by, limit, offset),
+            Statement::Select(sel) => self.exec_select(txn, sel),
             Statement::Update {
                 table,
                 assignments,
                 filter,
             } => self.exec_update(txn, table, assignments, filter),
             Statement::Delete { table, filter } => self.exec_delete(txn, table, filter),
+            Statement::Explain(inner) => match *inner {
+                Statement::Select(sel) => self.exec_explain(txn, sel),
+                _ => Err(EngineError::Unsupported("EXPLAIN expects a SELECT".into())),
+            },
         }
     }
 
@@ -464,80 +463,320 @@ impl Database {
         Ok(Output::Affected(count))
     }
 
-    // ---- SELECT -----------------------------------------------------------
+    // ---- SELECT / EXPLAIN (plan + execute) --------------------------------
 
-    #[allow(clippy::too_many_arguments)]
-    fn exec_select(
-        &mut self,
-        txn: TxnId,
-        items: Vec<SelectItem>,
-        from: String,
-        filter: Option<Expr>,
-        order_by: Option<sql::ast::OrderBy>,
-        limit: Option<u64>,
-        offset: Option<u64>,
-    ) -> Result<Output, EngineError> {
-        let schema = self.schema_of(&from)?;
+    fn exec_select(&mut self, txn: TxnId, sel: Select) -> Result<Output, EngineError> {
         let snap = self.mgr.snapshot(txn).clone();
-        let types = schema.types();
+        let plan = self.build_plan(&sel, &snap)?;
+        let rs = self.run_plan(&plan, &snap)?;
+        Ok(Output::Rows {
+            columns: rs.schema.iter().map(|c| c.name.clone()).collect(),
+            rows: rs.rows,
+        })
+    }
 
-        let mut rows: Vec<Vec<Value>> = Vec::new();
-        for (_key, chain) in self.table_scan(schema.root)? {
-            if let Some(i) = mvcc::visible_index(&chain, &snap, &self.mgr) {
-                rows.push(tuple::decode_tuple(&types, &chain[i].data)?);
+    fn exec_explain(&mut self, txn: TxnId, sel: Select) -> Result<Output, EngineError> {
+        let snap = self.mgr.snapshot(txn).clone();
+        let plan = self.build_plan(&sel, &snap)?;
+        let rows = plan
+            .explain()
+            .into_iter()
+            .map(|line| vec![Value::Text(line)])
+            .collect();
+        Ok(Output::Rows {
+            columns: vec!["QUERY PLAN".into()],
+            rows,
+        })
+    }
+
+    /// A base relation participating in a query: its alias, schema and estimated size.
+    fn gather_rels(&mut self, sel: &Select, snap: &Snapshot) -> Result<Vec<Rel>, EngineError> {
+        let mut refs: Vec<&TableRef> = vec![&sel.from];
+        refs.extend(sel.joins.iter().map(|j| &j.right));
+        let mut rels = Vec::with_capacity(refs.len());
+        for r in refs {
+            let schema = self.schema_of(&r.name)?;
+            let alias = r.key().to_string();
+            if rels
+                .iter()
+                .any(|x: &Rel| x.alias.eq_ignore_ascii_case(&alias))
+            {
+                return Err(EngineError::Other(format!(
+                    "duplicate table name '{alias}'"
+                )));
             }
-        }
-
-        if let Some(pred) = &filter {
-            let mut kept = Vec::new();
-            for row in rows {
-                if matches!(eval::eval(pred, &schema, &row)?, Value::Boolean(true)) {
-                    kept.push(row);
-                }
-            }
-            rows = kept;
-        }
-
-        if let Some(ob) = &order_by {
-            let idx = schema
-                .column_index(&ob.column)
-                .ok_or_else(|| EngineError::UnknownColumn(ob.column.clone()))?;
-            rows.sort_by(|a, b| {
-                let ord = value_cmp(&a[idx], &b[idx]);
-                if ob.descending {
-                    ord.reverse()
-                } else {
-                    ord
-                }
+            let est = self.count_visible(&schema, snap)? as f64;
+            rels.push(Rel {
+                alias,
+                table: r.name.clone(),
+                schema,
+                est,
             });
         }
+        Ok(rels)
+    }
 
-        if let Some(off) = offset {
-            let off = off as usize;
-            rows = if off >= rows.len() {
-                Vec::new()
+    /// Build a physical plan for `sel`. (M5 baseline: left-deep in written order,
+    /// hash join for equijoins, sequential scans. The optimizer refines this.)
+    fn build_plan(&mut self, sel: &Select, snap: &Snapshot) -> Result<Plan, EngineError> {
+        let rels = self.gather_rels(sel, snap)?;
+        let scope = scope_columns(&rels);
+
+        // Left-deep join tree over the relations in written order.
+        let mut node = scan_plan(&rels[0]);
+        let mut left_cols = cols_of(&rels[0]);
+        for (i, join) in sel.joins.iter().enumerate() {
+            let right = &rels[i + 1];
+            let right_cols = cols_of(right);
+            let hash_keys = planner::detect_hash_keys(&join.on, &left_cols, &right_cols);
+            let est = if hash_keys.is_some() {
+                node.est().max(right.est)
             } else {
-                rows.split_off(off)
+                (node.est().max(1.0)) * (right.est.max(1.0)) * 0.3
+            };
+            node = Plan::Join {
+                left: Box::new(node),
+                right: Box::new(scan_plan(right)),
+                jt: join.join_type,
+                on: join.on.clone(),
+                hash_keys,
+                est,
+            };
+            left_cols.extend(right_cols);
+        }
+
+        // WHERE (applied after joins in the baseline plan).
+        if let Some(pred) = &sel.filter {
+            let est = node.est() * 0.3;
+            node = Plan::Filter {
+                input: Box::new(node),
+                pred: pred.clone(),
+                est,
             };
         }
-        if let Some(lim) = limit {
-            rows.truncate(lim as usize);
+
+        // Aggregation, if any aggregate appears or GROUP BY is present.
+        let mut aggs = Vec::new();
+        for item in &sel.items {
+            if let SelectItem::Expr { expr, .. } = item {
+                planner::collect_aggs_in(expr, &mut aggs);
+            }
+        }
+        if let Some(h) = &sel.having {
+            planner::collect_aggs_in(h, &mut aggs);
+        }
+        for ob in &sel.order_by {
+            planner::collect_aggs_in(&ob.expr, &mut aggs);
+        }
+        let aggregate_mode = !aggs.is_empty() || !sel.group_by.is_empty();
+
+        let mut subs: Vec<(Expr, Expr)> = Vec::new();
+        let mut project_scope = scope.clone();
+        if aggregate_mode {
+            let mut out_names = Vec::new();
+            for (i, g) in sel.group_by.iter().enumerate() {
+                let name = match g {
+                    Expr::Column { name, .. } => name.clone(),
+                    _ => format!("$grp{i}"),
+                };
+                subs.push((g.clone(), Expr::col(name.clone())));
+                out_names.push(name);
+            }
+            for (i, a) in aggs.iter().enumerate() {
+                let name = format!("$agg{i}");
+                subs.push((a.clone(), Expr::col(name.clone())));
+                out_names.push(name);
+            }
+            project_scope = out_names
+                .iter()
+                .map(|n| Col {
+                    table: None,
+                    name: n.clone(),
+                    ty: DataType::Integer,
+                })
+                .collect();
+            let est = node.est().sqrt().max(1.0);
+            node = Plan::Aggregate {
+                input: Box::new(node),
+                group_by: sel.group_by.clone(),
+                aggs,
+                out_names,
+                est,
+            };
         }
 
-        let indices = resolve_projection(&items, &schema)?;
-        let columns = indices
-            .iter()
-            .map(|&i| schema.columns[i].name.clone())
-            .collect();
-        let projected = rows
-            .into_iter()
-            .map(|row| indices.iter().map(|&i| row[i].clone()).collect())
-            .collect();
+        // HAVING (post-aggregation).
+        if let Some(h) = &sel.having {
+            let pred = planner::substitute(h, &subs);
+            let est = node.est() * 0.5;
+            node = Plan::Filter {
+                input: Box::new(node),
+                pred,
+                est,
+            };
+        }
 
-        Ok(Output::Rows {
-            columns,
-            rows: projected,
-        })
+        // ORDER BY.
+        if !sel.order_by.is_empty() {
+            let keys = sel
+                .order_by
+                .iter()
+                .map(|ob| (planner::substitute(&ob.expr, &subs), ob.descending))
+                .collect();
+            let est = node.est();
+            node = Plan::Sort {
+                input: Box::new(node),
+                keys,
+                est,
+            };
+        }
+
+        // Projection.
+        let (exprs, names) = expand_projection(&sel.items, &project_scope, &subs)?;
+        let est = node.est();
+        node = Plan::Project {
+            input: Box::new(node),
+            exprs,
+            names,
+            est,
+        };
+
+        // LIMIT / OFFSET.
+        if sel.limit.is_some() || sel.offset.is_some() {
+            let est = node.est();
+            node = Plan::Limit {
+                input: Box::new(node),
+                limit: sel.limit,
+                offset: sel.offset,
+                est,
+            };
+        }
+        Ok(node)
+    }
+
+    fn run_plan(&mut self, plan: &Plan, snap: &Snapshot) -> Result<RowSet, EngineError> {
+        match plan {
+            Plan::Scan {
+                table,
+                alias,
+                access,
+                filter,
+                ..
+            } => {
+                let rs = self.exec_scan(table, alias, access, snap)?;
+                match filter {
+                    Some(p) => plan::filter_rows(rs, p),
+                    None => Ok(rs),
+                }
+            }
+            Plan::Join {
+                left,
+                right,
+                jt,
+                on,
+                hash_keys,
+                ..
+            } => {
+                let l = self.run_plan(left, snap)?;
+                let r = self.run_plan(right, snap)?;
+                match hash_keys {
+                    Some((lk, rk)) => plan::hash_join(&l, &r, *jt, lk, rk, on),
+                    None => plan::nested_loop_join(&l, &r, *jt, on),
+                }
+            }
+            Plan::Filter { input, pred, .. } => {
+                let rs = self.run_plan(input, snap)?;
+                plan::filter_rows(rs, pred)
+            }
+            Plan::Aggregate {
+                input,
+                group_by,
+                aggs,
+                out_names,
+                ..
+            } => {
+                let rs = self.run_plan(input, snap)?;
+                plan::aggregate_rows(rs, group_by, aggs, out_names)
+            }
+            Plan::Sort { input, keys, .. } => {
+                let rs = self.run_plan(input, snap)?;
+                plan::sort_rows(rs, keys)
+            }
+            Plan::Project {
+                input,
+                exprs,
+                names,
+                ..
+            } => {
+                let rs = self.run_plan(input, snap)?;
+                plan::project_rows(rs, exprs, names)
+            }
+            Plan::Limit {
+                input,
+                limit,
+                offset,
+                ..
+            } => {
+                let rs = self.run_plan(input, snap)?;
+                Ok(plan::limit_rows(rs, *limit, *offset))
+            }
+        }
+    }
+
+    /// Materialise a base relation's MVCC-visible rows as a `RowSet`.
+    fn exec_scan(
+        &mut self,
+        table: &str,
+        alias: &str,
+        access: &Access,
+        snap: &Snapshot,
+    ) -> Result<RowSet, EngineError> {
+        let schema = self.schema_of(table)?;
+        let types = schema.types();
+        let cols = schema
+            .columns
+            .iter()
+            .map(|c| Col {
+                table: Some(alias.to_string()),
+                name: c.name.clone(),
+                ty: c.data_type,
+            })
+            .collect();
+        let mut rows = Vec::new();
+        match access {
+            Access::Seq => {
+                for (_k, chain) in self.table_scan(schema.root)? {
+                    if let Some(i) = mvcc::visible_index(&chain, snap, &self.mgr) {
+                        rows.push(tuple::decode_tuple(&types, &chain[i].data)?);
+                    }
+                }
+            }
+            Access::IndexSeek { key, .. } => {
+                // The planner emits PK equality seeks only.
+                let kv = eval::eval(key, &empty_schema(), &[])?;
+                let kbytes = tuple::value_to_key(&kv)?;
+                if let Some(chain) = self.table_get_chain(schema.root, &kbytes)? {
+                    if let Some(i) = mvcc::visible_index(&chain, snap, &self.mgr) {
+                        rows.push(tuple::decode_tuple(&types, &chain[i].data)?);
+                    }
+                }
+            }
+        }
+        Ok(RowSet { schema: cols, rows })
+    }
+
+    fn count_visible(
+        &mut self,
+        schema: &TableSchema,
+        snap: &Snapshot,
+    ) -> Result<usize, EngineError> {
+        let mut n = 0;
+        for (_k, chain) in self.table_scan(schema.root)? {
+            if mvcc::visible_index(&chain, snap, &self.mgr).is_some() {
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 
     // ---- UPDATE / DELETE --------------------------------------------------
@@ -661,22 +900,92 @@ fn empty_schema() -> TableSchema {
     }
 }
 
-fn resolve_projection(
+/// A base relation participating in a query.
+struct Rel {
+    alias: String,
+    table: String,
+    schema: TableSchema,
+    est: f64,
+}
+
+/// The qualified columns a relation contributes to a query's scope.
+fn cols_of(rel: &Rel) -> Vec<Col> {
+    rel.schema
+        .columns
+        .iter()
+        .map(|c| Col {
+            table: Some(rel.alias.clone()),
+            name: c.name.clone(),
+            ty: c.data_type,
+        })
+        .collect()
+}
+
+/// The combined scope of all relations, in order.
+fn scope_columns(rels: &[Rel]) -> Vec<Col> {
+    rels.iter().flat_map(cols_of).collect()
+}
+
+/// A sequential-scan plan node for a base relation.
+fn scan_plan(rel: &Rel) -> Plan {
+    Plan::Scan {
+        table: rel.table.clone(),
+        alias: rel.alias.clone(),
+        access: Access::Seq,
+        filter: None,
+        est: rel.est,
+    }
+}
+
+/// Expand `SELECT` items into projection expressions and output column names,
+/// applying `subs` (the aggregate/group substitutions) to each expression.
+fn expand_projection(
     items: &[SelectItem],
-    schema: &TableSchema,
-) -> Result<Vec<usize>, EngineError> {
-    let mut out = Vec::new();
+    scope: &[Col],
+    subs: &[(Expr, Expr)],
+) -> Result<(Vec<Expr>, Vec<String>), EngineError> {
+    let mut exprs = Vec::new();
+    let mut names = Vec::new();
     for item in items {
         match item {
-            SelectItem::Wildcard => out.extend(0..schema.columns.len()),
-            SelectItem::Column(name) => out.push(
-                schema
-                    .column_index(name)
-                    .ok_or_else(|| EngineError::UnknownColumn(name.clone()))?,
-            ),
+            SelectItem::Wildcard => {
+                for c in scope {
+                    exprs.push(Expr::Column {
+                        table: c.table.clone(),
+                        name: c.name.clone(),
+                    });
+                    names.push(c.name.clone());
+                }
+            }
+            SelectItem::QualifiedWildcard(alias) => {
+                let mut any = false;
+                for c in scope {
+                    if c.table
+                        .as_deref()
+                        .is_some_and(|t| t.eq_ignore_ascii_case(alias))
+                    {
+                        exprs.push(Expr::Column {
+                            table: c.table.clone(),
+                            name: c.name.clone(),
+                        });
+                        names.push(c.name.clone());
+                        any = true;
+                    }
+                }
+                if !any {
+                    return Err(EngineError::UnknownTable(alias.clone()));
+                }
+            }
+            SelectItem::Expr { expr, alias } => {
+                let name = alias.clone().unwrap_or_else(|| planner::default_name(expr));
+                let projected = planner::substitute(expr, subs);
+                planner::validate_cols(&projected, scope)?;
+                exprs.push(projected);
+                names.push(name);
+            }
         }
     }
-    Ok(out)
+    Ok((exprs, names))
 }
 
 fn coerce(v: Value, col: &ColumnInfo) -> Result<Value, EngineError> {
@@ -723,25 +1032,6 @@ fn coerce(v: Value, col: &ColumnInfo) -> Result<Value, EngineError> {
                 "column '{}' expects BOOLEAN, got {other:?}",
                 col.name
             ))),
-        },
-    }
-}
-
-fn value_cmp(a: &Value, b: &Value) -> Ordering {
-    let num = |v: &Value| match v {
-        Value::Integer(x) => Some(*x as f64),
-        Value::Real(x) => Some(*x),
-        _ => None,
-    };
-    match (a, b) {
-        (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Null, _) => Ordering::Less,
-        (_, Value::Null) => Ordering::Greater,
-        (Value::Text(x), Value::Text(y)) => x.cmp(y),
-        (Value::Boolean(x), Value::Boolean(y)) => x.cmp(y),
-        _ => match (num(a), num(b)) {
-            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
-            _ => Ordering::Equal,
         },
     }
 }

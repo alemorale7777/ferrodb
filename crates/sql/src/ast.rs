@@ -43,11 +43,25 @@ pub enum UnOp {
     Neg,
 }
 
+/// An aggregate function.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AggFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
 /// A scalar expression.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
     Literal(Value),
-    Column(String),
+    /// A column reference, optionally qualified by a table name/alias.
+    Column {
+        table: Option<String>,
+        name: String,
+    },
     Binary {
         op: BinOp,
         left: Box<Expr>,
@@ -61,6 +75,21 @@ pub enum Expr {
         expr: Box<Expr>,
         negated: bool,
     },
+    /// An aggregate call; `arg == None` is `COUNT(*)`.
+    Aggregate {
+        func: AggFunc,
+        arg: Option<Box<Expr>>,
+    },
+}
+
+impl Expr {
+    /// Convenience constructor for an unqualified column reference.
+    pub fn col(name: impl Into<String>) -> Expr {
+        Expr::Column {
+            table: None,
+            name: name.into(),
+        }
+    }
 }
 
 /// A column definition inside `CREATE TABLE`.
@@ -75,15 +104,62 @@ pub struct ColumnDef {
 /// A `SELECT` projection item.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SelectItem {
+    /// `*`
     Wildcard,
-    Column(String),
+    /// `t.*`
+    QualifiedWildcard(String),
+    /// `<expr> [AS alias]`
+    Expr { expr: Expr, alias: Option<String> },
 }
 
-/// `ORDER BY <column> [ASC|DESC]`.
+/// A base table reference with an optional alias.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableRef {
+    pub name: String,
+    pub alias: Option<String>,
+}
+
+impl TableRef {
+    /// The name this reference is addressed by (alias if present, else table name).
+    pub fn key(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// A join kind.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JoinType {
+    Inner,
+    Left,
+}
+
+/// One `JOIN <right> ON <predicate>` clause in a left-deep chain.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Join {
+    pub join_type: JoinType,
+    pub right: TableRef,
+    pub on: Expr,
+}
+
+/// `ORDER BY <expr> [ASC|DESC]`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OrderBy {
-    pub column: String,
+    pub expr: Expr,
     pub descending: bool,
+}
+
+/// A `SELECT` query.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Select {
+    pub items: Vec<SelectItem>,
+    pub from: TableRef,
+    pub joins: Vec<Join>,
+    pub filter: Option<Expr>,
+    pub group_by: Vec<Expr>,
+    pub having: Option<Expr>,
+    pub order_by: Vec<OrderBy>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
 }
 
 /// A top-level SQL statement.
@@ -101,14 +177,7 @@ pub enum Statement {
         columns: Option<Vec<String>>,
         rows: Vec<Vec<Expr>>,
     },
-    Select {
-        items: Vec<SelectItem>,
-        from: String,
-        filter: Option<Expr>,
-        order_by: Option<OrderBy>,
-        limit: Option<u64>,
-        offset: Option<u64>,
-    },
+    Select(Select),
     Update {
         table: String,
         assignments: Vec<(String, Expr)>,
@@ -118,4 +187,6 @@ pub enum Statement {
         table: String,
         filter: Option<Expr>,
     },
+    /// `EXPLAIN <select>` — return the physical plan instead of running it.
+    Explain(Box<Statement>),
 }

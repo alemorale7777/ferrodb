@@ -35,6 +35,15 @@ pub enum Keyword {
     Real,
     Text,
     Boolean,
+    As,
+    Join,
+    Inner,
+    Left,
+    Outer,
+    On,
+    Group,
+    Having,
+    Explain,
 }
 
 fn keyword_from(word: &str) -> Option<Keyword> {
@@ -71,6 +80,15 @@ fn keyword_from(word: &str) -> Option<Keyword> {
         "REAL" | "FLOAT" | "DOUBLE" => Real,
         "TEXT" | "VARCHAR" => Text,
         "BOOLEAN" | "BOOL" => Boolean,
+        "AS" => As,
+        "JOIN" => Join,
+        "INNER" => Inner,
+        "LEFT" => Left,
+        "OUTER" => Outer,
+        "ON" => On,
+        "GROUP" => Group,
+        "HAVING" => Having,
+        "EXPLAIN" => Explain,
         _ => return None,
     })
 }
@@ -86,6 +104,7 @@ pub enum Token {
     RParen,
     Comma,
     Semicolon,
+    Dot,
     Star,
     Eq,
     Ne,
@@ -122,6 +141,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, SqlError> {
             }
             ';' => {
                 out.push(Token::Semicolon);
+                i += 1;
+            }
+            '.' => {
+                out.push(Token::Dot);
                 i += 1;
             }
             '*' => {

@@ -5,37 +5,66 @@ use sql::ast::{BinOp, Expr, UnOp, Value};
 use crate::catalog::TableSchema;
 use crate::EngineError;
 
-/// Evaluate `expr` against `row` (column order matches `schema.columns`).
-/// For contexts without a row (e.g. `INSERT ... VALUES`), pass an empty schema/row.
-pub fn eval(expr: &Expr, schema: &TableSchema, row: &[Value]) -> Result<Value, EngineError> {
+/// Evaluate `expr`, resolving leaf nodes (`Column` / `Aggregate`) through `leaf`.
+///
+/// `leaf` returns `Some(result)` for a node it resolves and `None` for nodes the
+/// generic walker should handle (literals, operators). This lets the same 3-valued
+/// logic serve single-table rows, joined rows with qualified columns, and
+/// post-aggregation rows where an aggregate reads a precomputed column.
+pub fn eval_with<F>(expr: &Expr, leaf: &F) -> Result<Value, EngineError>
+where
+    F: Fn(&Expr) -> Option<Result<Value, EngineError>>,
+{
+    if let Some(v) = leaf(expr) {
+        return v;
+    }
     match expr {
         Expr::Literal(v) => Ok(v.clone()),
-        Expr::Column(name) => {
-            let idx = schema
-                .column_index(name)
-                .ok_or_else(|| EngineError::UnknownColumn(name.clone()))?;
-            Ok(row[idx].clone())
-        }
         Expr::Unary { op, expr } => {
-            let v = eval(expr, schema, row)?;
-            match (op, v) {
-                (_, Value::Null) => Ok(Value::Null),
-                (UnOp::Neg, Value::Integer(x)) => Ok(Value::Integer(-x)),
-                (UnOp::Neg, Value::Real(x)) => Ok(Value::Real(-x)),
-                (UnOp::Not, Value::Boolean(b)) => Ok(Value::Boolean(!b)),
-                (op, v) => Err(EngineError::Type(format!("cannot apply {op:?} to {v:?}"))),
-            }
+            let v = eval_with(expr, leaf)?;
+            apply_unary(*op, v)
         }
         Expr::IsNull { expr, negated } => {
-            let v = eval(expr, schema, row)?;
+            let v = eval_with(expr, leaf)?;
             let is_null = matches!(v, Value::Null);
             Ok(Value::Boolean(if *negated { !is_null } else { is_null }))
         }
         Expr::Binary { op, left, right } => {
-            let l = eval(left, schema, row)?;
-            let r = eval(right, schema, row)?;
+            let l = eval_with(left, leaf)?;
+            let r = eval_with(right, leaf)?;
             eval_binary(*op, l, r)
         }
+        Expr::Column { table, name } => Err(EngineError::UnknownColumn(match table {
+            Some(t) => format!("{t}.{name}"),
+            None => name.clone(),
+        })),
+        Expr::Aggregate { .. } => Err(EngineError::Unsupported(
+            "aggregate function not allowed here".into(),
+        )),
+    }
+}
+
+/// Evaluate `expr` against a single-table `row` (column order matches `schema`).
+/// For contexts without a row (e.g. `INSERT ... VALUES`), pass an empty schema/row.
+pub fn eval(expr: &Expr, schema: &TableSchema, row: &[Value]) -> Result<Value, EngineError> {
+    eval_with(expr, &|e: &Expr| match e {
+        Expr::Column { name, .. } => Some(
+            schema
+                .column_index(name)
+                .map(|i| row[i].clone())
+                .ok_or_else(|| EngineError::UnknownColumn(name.clone())),
+        ),
+        _ => None,
+    })
+}
+
+fn apply_unary(op: UnOp, v: Value) -> Result<Value, EngineError> {
+    match (op, v) {
+        (_, Value::Null) => Ok(Value::Null),
+        (UnOp::Neg, Value::Integer(x)) => Ok(Value::Integer(-x)),
+        (UnOp::Neg, Value::Real(x)) => Ok(Value::Real(-x)),
+        (UnOp::Not, Value::Boolean(b)) => Ok(Value::Boolean(!b)),
+        (op, v) => Err(EngineError::Type(format!("cannot apply {op:?} to {v:?}"))),
     }
 }
 

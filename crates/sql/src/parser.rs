@@ -7,6 +7,18 @@ use crate::ast::*;
 use crate::token::{Keyword, Token};
 use crate::SqlError;
 
+/// Recognise an aggregate function name (case-insensitive).
+fn agg_from(name: &str) -> Option<AggFunc> {
+    Some(match name.to_ascii_uppercase().as_str() {
+        "COUNT" => AggFunc::Count,
+        "SUM" => AggFunc::Sum,
+        "AVG" => AggFunc::Avg,
+        "MIN" => AggFunc::Min,
+        "MAX" => AggFunc::Max,
+        _ => return None,
+    })
+}
+
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -73,6 +85,10 @@ impl Parser {
             Token::Keyword(Keyword::Select) => self.parse_select()?,
             Token::Keyword(Keyword::Update) => self.parse_update()?,
             Token::Keyword(Keyword::Delete) => self.parse_delete()?,
+            Token::Keyword(Keyword::Explain) => {
+                self.next();
+                Statement::Explain(Box::new(self.parse_select()?))
+            }
             other => {
                 return Err(SqlError::Parse(format!(
                     "unexpected start of statement: {other:?}"
@@ -201,12 +217,7 @@ impl Parser {
         self.eat_kw(Keyword::Select)?;
         let mut items = Vec::new();
         loop {
-            if self.peek() == &Token::Star {
-                self.next();
-                items.push(SelectItem::Wildcard);
-            } else {
-                items.push(SelectItem::Column(self.ident()?));
-            }
+            items.push(self.parse_select_item()?);
             if self.peek() == &Token::Comma {
                 self.next();
             } else {
@@ -214,8 +225,31 @@ impl Parser {
             }
         }
         self.eat_kw(Keyword::From)?;
-        let from = self.ident()?;
+        let from = self.parse_table_ref()?;
+        let joins = self.parse_joins()?;
         let filter = if self.is_kw(Keyword::Where) {
+            self.next();
+            Some(self.parse_expr(0)?)
+        } else {
+            None
+        };
+        let group_by = if self.is_kw(Keyword::Group) {
+            self.next();
+            self.eat_kw(Keyword::By)?;
+            let mut keys = Vec::new();
+            loop {
+                keys.push(self.parse_expr(0)?);
+                if self.peek() == &Token::Comma {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+            keys
+        } else {
+            Vec::new()
+        };
+        let having = if self.is_kw(Keyword::Having) {
             self.next();
             Some(self.parse_expr(0)?)
         } else {
@@ -224,19 +258,28 @@ impl Parser {
         let order_by = if self.is_kw(Keyword::Order) {
             self.next();
             self.eat_kw(Keyword::By)?;
-            let column = self.ident()?;
-            let descending = if self.is_kw(Keyword::Desc) {
-                self.next();
-                true
-            } else {
-                if self.is_kw(Keyword::Asc) {
+            let mut keys = Vec::new();
+            loop {
+                let expr = self.parse_expr(0)?;
+                let descending = if self.is_kw(Keyword::Desc) {
                     self.next();
+                    true
+                } else {
+                    if self.is_kw(Keyword::Asc) {
+                        self.next();
+                    }
+                    false
+                };
+                keys.push(OrderBy { expr, descending });
+                if self.peek() == &Token::Comma {
+                    self.next();
+                } else {
+                    break;
                 }
-                false
-            };
-            Some(OrderBy { column, descending })
+            }
+            keys
         } else {
-            None
+            Vec::new()
         };
         let mut limit = None;
         let mut offset = None;
@@ -248,14 +291,86 @@ impl Parser {
                 offset = Some(self.integer()?);
             }
         }
-        Ok(Statement::Select {
+        Ok(Statement::Select(Select {
             items,
             from,
+            joins,
             filter,
+            group_by,
+            having,
             order_by,
             limit,
             offset,
-        })
+        }))
+    }
+
+    fn parse_select_item(&mut self) -> PResult<SelectItem> {
+        if self.peek() == &Token::Star {
+            self.next();
+            return Ok(SelectItem::Wildcard);
+        }
+        // `t.*`
+        if let Token::Ident(name) = self.peek().clone() {
+            if self.tokens.get(self.pos + 1) == Some(&Token::Dot)
+                && self.tokens.get(self.pos + 2) == Some(&Token::Star)
+            {
+                self.next();
+                self.next();
+                self.next();
+                return Ok(SelectItem::QualifiedWildcard(name));
+            }
+        }
+        let expr = self.parse_expr(0)?;
+        let alias = self.parse_optional_alias()?;
+        Ok(SelectItem::Expr { expr, alias })
+    }
+
+    /// `AS ident`, or a bare trailing identifier, used as an alias.
+    fn parse_optional_alias(&mut self) -> PResult<Option<String>> {
+        if self.is_kw(Keyword::As) {
+            self.next();
+            Ok(Some(self.ident()?))
+        } else if matches!(self.peek(), Token::Ident(_)) {
+            Ok(Some(self.ident()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn parse_table_ref(&mut self) -> PResult<TableRef> {
+        let name = self.ident()?;
+        let alias = self.parse_optional_alias()?;
+        Ok(TableRef { name, alias })
+    }
+
+    fn parse_joins(&mut self) -> PResult<Vec<Join>> {
+        let mut joins = Vec::new();
+        loop {
+            let join_type = if self.is_kw(Keyword::Inner) {
+                self.next();
+                JoinType::Inner
+            } else if self.is_kw(Keyword::Left) {
+                self.next();
+                if self.is_kw(Keyword::Outer) {
+                    self.next();
+                }
+                JoinType::Left
+            } else if self.is_kw(Keyword::Join) {
+                JoinType::Inner
+            } else {
+                break;
+            };
+            self.eat_kw(Keyword::Join)?;
+            let right = self.parse_table_ref()?;
+            self.eat_kw(Keyword::On)?;
+            let on = self.parse_expr(0)?;
+            joins.push(Join {
+                join_type,
+                right,
+                on,
+            });
+        }
+        Ok(joins)
     }
 
     fn parse_update(&mut self) -> PResult<Statement> {
@@ -378,7 +493,36 @@ impl Parser {
             Token::Keyword(Keyword::True) => Ok(Expr::Literal(Value::Boolean(true))),
             Token::Keyword(Keyword::False) => Ok(Expr::Literal(Value::Boolean(false))),
             Token::Keyword(Keyword::Null) => Ok(Expr::Literal(Value::Null)),
-            Token::Ident(name) => Ok(Expr::Column(name)),
+            Token::Ident(name) => {
+                if self.peek() == &Token::LParen {
+                    let Some(func) = agg_from(&name) else {
+                        return Err(SqlError::Parse(format!("unknown function '{name}'")));
+                    };
+                    self.next(); // (
+                    let arg = if self.peek() == &Token::Star {
+                        self.next();
+                        if func != AggFunc::Count {
+                            return Err(SqlError::Parse(
+                                "'*' is only valid as COUNT(*)".to_string(),
+                            ));
+                        }
+                        None
+                    } else {
+                        Some(Box::new(self.parse_expr(0)?))
+                    };
+                    self.eat(&Token::RParen)?;
+                    Ok(Expr::Aggregate { func, arg })
+                } else if self.peek() == &Token::Dot {
+                    self.next(); // .
+                    let column = self.ident()?;
+                    Ok(Expr::Column {
+                        table: Some(name),
+                        name: column,
+                    })
+                } else {
+                    Ok(Expr::Column { table: None, name })
+                }
+            }
             Token::LParen => {
                 let e = self.parse_expr(0)?;
                 self.eat(&Token::RParen)?;
