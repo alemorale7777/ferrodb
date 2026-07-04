@@ -10,6 +10,7 @@ pub mod eval;
 pub mod mvcc;
 pub mod plan;
 pub mod planner;
+pub mod treeview;
 pub mod tuple;
 pub mod txn;
 
@@ -206,6 +207,44 @@ impl Database {
     /// Names of all user tables.
     pub fn list_tables(&mut self) -> Result<Vec<String>, EngineError> {
         catalog::list_tables(&mut self.bp, &self.meta)
+    }
+
+    /// A view of a table's B+-tree structure (for the web playground visualizer).
+    pub fn table_tree(&mut self, table: &str) -> Result<treeview::TreeNode, EngineError> {
+        let schema = self.schema_of(table)?;
+        let kind =
+            treeview::KeyKind::for_pk(schema.pk_index().map(|i| schema.columns[i].data_type));
+        self.walk_tree(schema.root, kind)
+    }
+
+    /// A table's B+-tree structure as JSON.
+    pub fn table_tree_json(&mut self, table: &str) -> Result<String, EngineError> {
+        Ok(self.table_tree(table)?.to_json())
+    }
+
+    fn walk_tree(
+        &mut self,
+        pid: PageId,
+        kind: treeview::KeyKind,
+    ) -> Result<treeview::TreeNode, EngineError> {
+        let f = self.bp.fetch(pid)?;
+        let page = self.bp.frame(f).clone();
+        self.bp.unpin(f);
+
+        if treeview::is_leaf(&page) {
+            return Ok(treeview::TreeNode::leaf(&page, kind));
+        }
+        let mut children = vec![self.walk_tree(storage::btree::node::left_child(&page), kind)?];
+        let mut keys = Vec::new();
+        for (k, child) in storage::btree::node::internal_entries(&page) {
+            keys.push(kind.render(&k));
+            children.push(self.walk_tree(child, kind)?);
+        }
+        Ok(treeview::TreeNode {
+            leaf: false,
+            keys,
+            children,
+        })
     }
 
     /// Flush all pages and persist the meta record.

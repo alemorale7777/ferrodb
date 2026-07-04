@@ -58,6 +58,31 @@ fn in_memory_database_runs_the_full_stack() {
 }
 
 #[test]
+fn table_tree_reflects_bplus_tree_structure() {
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    for i in 1..=300 {
+        db.execute(&format!("INSERT INTO t VALUES ({i}, {})", i * 2))
+            .unwrap();
+    }
+    let tree = db.table_tree("t").unwrap();
+    // 300 entries cannot fit one 4 KiB leaf, so the tree has split.
+    assert!(!tree.leaf, "root should be internal after 300 inserts");
+    assert!(tree.height() >= 2, "tree should have multiple levels");
+    assert_eq!(
+        tree.leaf_key_count(),
+        300,
+        "every key present across leaves"
+    );
+
+    // JSON export is well-formed enough for the visualizer.
+    let json = db.table_tree_json("t").unwrap();
+    assert!(json.starts_with("{\"leaf\":false"));
+    assert!(json.contains("\"leaf\":true"));
+}
+
+#[test]
 fn inner_join_matches_rows() {
     let mut db = users_and_orders();
     let out = db

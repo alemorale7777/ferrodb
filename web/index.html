@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ferrodb — WebAssembly playground</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d; --fg: #e6edf3;
+    --muted: #8b949e; --accent: #58a6ff; --leaf: #1f6feb; --internal: #8957e5;
+    --ok: #3fb950; --err: #f85149; --mono: ui-monospace, "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  header { padding: 16px 22px; border-bottom: 1px solid var(--border); }
+  header h1 { margin: 0; font-size: 18px; }
+  header h1 .db { color: var(--accent); }
+  header p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+  main { display: grid; grid-template-columns: 440px 1fr; gap: 0; height: calc(100vh - 66px); }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; height: auto; } }
+  .left { border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
+  .right { display: flex; flex-direction: column; min-height: 0; }
+  .section { padding: 14px 18px; border-bottom: 1px solid var(--border); }
+  .section h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
+                letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+  textarea { width: 100%; height: 120px; resize: vertical; background: #0b0f14; color: var(--fg);
+             border: 1px solid var(--border); border-radius: 6px; padding: 10px; font: 13px/1.5 var(--mono); }
+  .row { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+  button { background: #21262d; color: var(--fg); border: 1px solid var(--border);
+           border-radius: 6px; padding: 7px 12px; cursor: pointer; font-size: 13px; }
+  button:hover { background: #2d333b; }
+  button.primary { background: var(--leaf); border-color: var(--leaf); }
+  button.primary:hover { filter: brightness(1.1); }
+  .examples button { font-size: 12px; padding: 5px 9px; }
+  input[type=text] { background: #0b0f14; color: var(--fg); border: 1px solid var(--border);
+                     border-radius: 6px; padding: 6px 9px; font: 13px var(--mono); width: 130px; }
+  .result { flex: 1; overflow: auto; padding: 14px 18px; min-height: 120px; }
+  table { border-collapse: collapse; font: 13px var(--mono); }
+  th, td { border: 1px solid var(--border); padding: 4px 10px; text-align: left; }
+  th { background: #1c2128; color: var(--muted); }
+  td.null { color: var(--muted); font-style: italic; }
+  .msg { color: var(--ok); font: 13px var(--mono); }
+  .err { color: var(--err); font: 13px var(--mono); white-space: pre-wrap; }
+  .viz { flex: 1; overflow: auto; padding: 8px; }
+  .viz svg { display: block; }
+  .legend { font-size: 12px; color: var(--muted); display: flex; gap: 16px; align-items: center; }
+  .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -1px; margin-right: 5px; }
+  .node rect { stroke-width: 1.5; }
+  .node text { font: 12px var(--mono); fill: #fff; }
+  .link { stroke: #3d444d; stroke-width: 1.5; fill: none; }
+  .loading { padding: 40px; color: var(--muted); }
+  code { background: #1c2128; padding: 1px 5px; border-radius: 4px; font: 12px var(--mono); }
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="db">ferrodb</span> — WebAssembly playground</h1>
+  <p>A relational database written from scratch in Rust, compiled to WebAssembly and running entirely in your browser. Watch the B+-tree split as you insert rows.</p>
+</header>
+<main>
+  <div class="left">
+    <div class="section">
+      <h2>SQL</h2>
+      <textarea id="sql" spellcheck="false"></textarea>
+      <div class="row">
+        <button class="primary" id="run">Run ▸</button>
+        <span style="color:var(--muted);font-size:12px">or ⌘/Ctrl-Enter</span>
+      </div>
+      <div class="row examples" id="examples"></div>
+    </div>
+    <div class="section" style="flex:0">
+      <h2>Result</h2>
+    </div>
+    <div class="result" id="result"><div class="loading">Loading engine…</div></div>
+  </div>
+  <div class="right">
+    <div class="section" style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <h2 style="margin:0">B+-tree of</h2>
+        <input type="text" id="table" value="nums" />
+        <button id="refresh">refresh</button>
+      </div>
+      <div class="legend">
+        <span><span class="swatch" style="background:var(--internal)"></span>internal</span>
+        <span><span class="swatch" style="background:var(--leaf)"></span>leaf</span>
+      </div>
+    </div>
+    <div class="viz" id="viz"><div class="loading">…</div></div>
+  </div>
+</main>
+
+<script type="module">
+import { loadFerrodb } from "./ferrodb.js";
+
+const EXAMPLES = [
+  ["seed 300 rows", "CREATE TABLE nums (id INTEGER PRIMARY KEY, sq INTEGER);\n-- inserted programmatically below"],
+  ["select range", "SELECT id, sq FROM nums WHERE id > 288 ORDER BY id"],
+  ["aggregate", "SELECT COUNT(*), SUM(sq), MAX(sq) FROM nums"],
+  ["EXPLAIN a seek", "EXPLAIN SELECT * FROM nums WHERE id = 150"],
+  ["join demo", "CREATE TABLE t (id INTEGER PRIMARY KEY, n TEXT);\nINSERT INTO t VALUES (1,'a'),(2,'b')"],
+];
+
+const $ = (id) => document.getElementById(id);
+const sqlBox = $("sql"), resultBox = $("result"), vizBox = $("viz"), tableInput = $("table");
+
+let db;
+
+function esc(s) {
+  return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+}
+
+function renderResult(res) {
+  if (res.error) { resultBox.innerHTML = `<div class="err">Error: ${esc(res.error)}</div>`; return; }
+  if (res.message) { resultBox.innerHTML = `<div class="msg">${esc(res.message)}</div>`; return; }
+  const { columns, rows } = res;
+  let html = "<table><thead><tr>" + columns.map((c) => `<th>${esc(c)}</th>`).join("") + "</tr></thead><tbody>";
+  for (const row of rows) {
+    html += "<tr>" + row.map((v) =>
+      v === null ? `<td class="null">NULL</td>` : `<td>${esc(v)}</td>`).join("") + "</tr>";
+  }
+  html += "</tbody></table>";
+  html += `<div style="color:var(--muted);margin-top:8px;font:12px var(--mono)">${rows.length} row${rows.length === 1 ? "" : "s"}</div>`;
+  resultBox.innerHTML = html;
+}
+
+// ---- B+-tree layout + SVG rendering ----
+const NODE_H = 32, LEVEL = 72, GAP = 16, CHAR = 7.4, PAD = 12, MARGIN = 20;
+
+function label(node) {
+  const k = node.keys;
+  if (node.leaf) {
+    if (k.length <= 5) return k.join(" ") || "·";
+    return `${k[0]} … ${k[k.length - 1]}  (${k.length})`;
+  }
+  return k.join("  ·  ");
+}
+function measure(n) {
+  n._label = label(n);
+  n._w = Math.max(44, n._label.length * CHAR + PAD * 2);
+  if (n.leaf || !n.children.length) { n._sub = n._w; return; }
+  let s = 0;
+  for (const c of n.children) { measure(c); s += c._sub; }
+  s += GAP * (n.children.length - 1);
+  n._sub = Math.max(n._w, s);
+}
+function place(n, x, depth) {
+  n._y = depth * LEVEL + MARGIN;
+  if (n.leaf || !n.children.length) { n._x = x + n._sub / 2; return; }
+  let cx = x;
+  for (const c of n.children) { place(c, cx, depth + 1); cx += c._sub + GAP; }
+  n._x = (n.children[0]._x + n.children[n.children.length - 1]._x) / 2;
+}
+function draw(root) {
+  measure(root);
+  place(root, MARGIN, 0);
+  let maxX = 0, maxY = 0;
+  const links = [], nodes = [];
+  (function walk(n) {
+    maxX = Math.max(maxX, n._x + n._w / 2 + MARGIN);
+    maxY = Math.max(maxY, n._y + NODE_H + MARGIN);
+    for (const c of n.children) {
+      links.push(`<path class="link" d="M ${n._x} ${n._y + NODE_H} C ${n._x} ${n._y + NODE_H + 26}, ${c._x} ${c._y - 26}, ${c._x} ${c._y}"/>`);
+      walk(c);
+    }
+    const fill = n.leaf ? "var(--leaf)" : "var(--internal)";
+    const x = n._x - n._w / 2;
+    nodes.push(
+      `<g class="node"><rect x="${x}" y="${n._y}" width="${n._w}" height="${NODE_H}" rx="6" fill="${fill}" stroke="#0d1117"/>` +
+      `<text x="${n._x}" y="${n._y + NODE_H / 2 + 4}" text-anchor="middle">${esc(n._label)}</text></g>`
+    );
+  })(root);
+  return `<svg width="${Math.max(maxX, 200)}" height="${Math.max(maxY, 120)}">${links.join("")}${nodes.join("")}</svg>`;
+}
+
+function refreshTree() {
+  const name = tableInput.value.trim();
+  if (!name) return;
+  const t = db.tree(name);
+  if (t.error) { vizBox.innerHTML = `<div class="err" style="padding:14px">${esc(t.error)}</div>`; return; }
+  const height = (function h(n){ return n.leaf ? 1 : 1 + Math.max(...n.children.map(h)); })(t);
+  const leaves = (function c(n){ return n.leaf ? n.keys.length : n.children.reduce((s,x)=>s+c(x),0); })(t);
+  vizBox.innerHTML =
+    `<div style="color:var(--muted);font:12px var(--mono);padding:2px 6px 8px">height ${height} · ${leaves} keys across leaves</div>` +
+    draw(t);
+}
+
+function runSql() {
+  const text = sqlBox.value;
+  const statements = text.split(";").map((s) => s.trim()).filter((s) => s && !s.startsWith("--"));
+  let last = null;
+  for (const s of statements) last = db.exec(s);
+  if (last) renderResult(last);
+  refreshTree();
+}
+
+async function main() {
+  const bytes = await fetch("./ferrodb_wasm.wasm").then((r) => r.arrayBuffer());
+  db = await loadFerrodb(bytes);
+
+  // Seed a table so the tree is interesting on first paint.
+  db.exec("CREATE TABLE nums (id INTEGER PRIMARY KEY, sq INTEGER)");
+  for (let i = 1; i <= 300; i++) db.exec(`INSERT INTO nums VALUES (${i}, ${i * i})`);
+
+  $("examples").innerHTML = "";
+  for (const [name, sql] of EXAMPLES) {
+    const b = document.createElement("button");
+    b.textContent = name;
+    b.onclick = () => { sqlBox.value = sql; };
+    $("examples").appendChild(b);
+  }
+  sqlBox.value = "SELECT id, sq FROM nums WHERE id > 294 ORDER BY id";
+  renderResult(db.exec(sqlBox.value));
+  refreshTree();
+
+  $("run").onclick = runSql;
+  $("refresh").onclick = refreshTree;
+  sqlBox.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); runSql(); }
+  });
+}
+
+main().catch((e) => { resultBox.innerHTML = `<div class="err">Failed to load engine: ${esc(e.message)}</div>`; });
+</script>
+</body>
+</html>

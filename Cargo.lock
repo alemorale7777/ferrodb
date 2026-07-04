@@ -119,6 +119,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrodb-wasm"
+version = "0.1.0"
+dependencies = [
+ "engine",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -215,6 +222,15 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "pgwire"
+version = "0.1.0"
+dependencies = [
+ "engine",
+ "sql",
+ "tempfile",
+]
 
 [[package]]
 name = "ppv-lite86"

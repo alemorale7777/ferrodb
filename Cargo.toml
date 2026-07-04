@@ -1,3 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/storage", "crates/sql", "crates/engine", "crates/cli", "crates/pgwire"]
+members = [
+    "crates/storage",
+    "crates/sql",
+    "crates/engine",
+    "crates/cli",
+    "crates/pgwire",
+    "crates/wasm",
+]
