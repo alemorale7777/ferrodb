@@ -5,6 +5,9 @@ indexes, write-ahead logging with crash recovery, MVCC transactions, a cost-base
 planner, and the PostgreSQL wire protocol. No third-party SQL parser, storage engine, or
 B+-tree crate: the point is to build the machine, not glue one together.
 
+📖 **[Read the architecture book →](https://alemorale7777.github.io/ferrodb/)** — a chapter-by-chapter
+tour of the whole engine, bottom-up.
+
 > **Status:** All 8 milestones complete and green — it runs real SQL with joins and
 > grouped aggregation, persisted to disk, survives a crash, gives concurrent transactions
 > snapshot isolation, plans queries with a cost-based optimizer, speaks the
