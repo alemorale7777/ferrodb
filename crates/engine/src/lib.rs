@@ -16,7 +16,7 @@ pub mod txn;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use sql::ast::{DataType, Expr, Select, SelectItem, Statement, TableRef, Value};
+use sql::ast::{BinOp, DataType, Expr, JoinType, Select, SelectItem, Statement, TableRef, Value};
 use storage::btree::tree::{load_meta, BPlusTree};
 use storage::buffer::BufferPool;
 use storage::disk::DiskManager;
@@ -516,44 +516,24 @@ impl Database {
         Ok(rels)
     }
 
-    /// Build a physical plan for `sel`. (M5 baseline: left-deep in written order,
-    /// hash join for equijoins, sequential scans. The optimizer refines this.)
+    /// Build a physical plan for `sel`.
+    ///
+    /// The cost-based optimizer engages for all-`INNER` queries of up to 8
+    /// relations: it pushes single-relation predicates to scans, picks a PK
+    /// index seek where a `pk = const` predicate is available, and orders the
+    /// left-deep join tree to minimise estimated intermediate cardinality.
+    /// Queries with a `LEFT` join fall back to a written-order left-deep plan
+    /// (reordering an outer join is not generally valid).
     fn build_plan(&mut self, sel: &Select, snap: &Snapshot) -> Result<Plan, EngineError> {
         let rels = self.gather_rels(sel, snap)?;
         let scope = scope_columns(&rels);
 
-        // Left-deep join tree over the relations in written order.
-        let mut node = scan_plan(&rels[0]);
-        let mut left_cols = cols_of(&rels[0]);
-        for (i, join) in sel.joins.iter().enumerate() {
-            let right = &rels[i + 1];
-            let right_cols = cols_of(right);
-            let hash_keys = planner::detect_hash_keys(&join.on, &left_cols, &right_cols);
-            let est = if hash_keys.is_some() {
-                node.est().max(right.est)
-            } else {
-                (node.est().max(1.0)) * (right.est.max(1.0)) * 0.3
-            };
-            node = Plan::Join {
-                left: Box::new(node),
-                right: Box::new(scan_plan(right)),
-                jt: join.join_type,
-                on: join.on.clone(),
-                hash_keys,
-                est,
-            };
-            left_cols.extend(right_cols);
-        }
-
-        // WHERE (applied after joins in the baseline plan).
-        if let Some(pred) = &sel.filter {
-            let est = node.est() * 0.3;
-            node = Plan::Filter {
-                input: Box::new(node),
-                pred: pred.clone(),
-                est,
-            };
-        }
+        let all_inner = sel.joins.iter().all(|j| j.join_type == JoinType::Inner);
+        let mut node = if all_inner && rels.len() <= 8 {
+            build_join_tree_optimized(&rels, sel)
+        } else {
+            build_join_tree_baseline(&rels, sel)
+        };
 
         // Aggregation, if any aggregate appears or GROUP BY is present.
         let mut aggs = Vec::new();
@@ -616,12 +596,25 @@ impl Database {
             };
         }
 
+        // Projection (computed before ORDER BY so order keys may reference aliases).
+        let (exprs, names) = expand_projection(&sel.items, &project_scope, &subs)?;
+        // A bare ORDER BY name that matches an output column resolves to that
+        // projected expression (SQL lets ORDER BY reference SELECT aliases).
+        let alias_subs: Vec<(Expr, Expr)> = names
+            .iter()
+            .zip(&exprs)
+            .map(|(n, e)| (Expr::col(n.clone()), e.clone()))
+            .collect();
+
         // ORDER BY.
         if !sel.order_by.is_empty() {
             let keys = sel
                 .order_by
                 .iter()
-                .map(|ob| (planner::substitute(&ob.expr, &subs), ob.descending))
+                .map(|ob| {
+                    let e = planner::substitute(&ob.expr, &alias_subs);
+                    (planner::substitute(&e, &subs), ob.descending)
+                })
                 .collect();
             let est = node.est();
             node = Plan::Sort {
@@ -632,7 +625,6 @@ impl Database {
         }
 
         // Projection.
-        let (exprs, names) = expand_projection(&sel.items, &project_scope, &subs)?;
         let est = node.est();
         node = Plan::Project {
             input: Box::new(node),
@@ -935,6 +927,294 @@ fn scan_plan(rel: &Rel) -> Plan {
         filter: None,
         est: rel.est,
     }
+}
+
+// ---- the cost-based optimizer ---------------------------------------------
+
+/// Split a predicate into its top-level `AND` conjuncts.
+fn split_and(e: &Expr, out: &mut Vec<Expr>) {
+    if let Expr::Binary {
+        op: BinOp::And,
+        left,
+        right,
+    } = e
+    {
+        split_and(left, out);
+        split_and(right, out);
+    } else {
+        out.push(e.clone());
+    }
+}
+
+/// `AND` a list of predicates back into one expression (`None` if empty).
+fn and_all(exprs: &[Expr]) -> Option<Expr> {
+    exprs.iter().cloned().reduce(|a, b| Expr::Binary {
+        op: BinOp::And,
+        left: Box::new(a),
+        right: Box::new(b),
+    })
+}
+
+/// Collect every column reference in `e`.
+fn collect_cols(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
+    match e {
+        Expr::Column { table, name } => out.push((table.clone(), name.clone())),
+        Expr::Binary { left, right, .. } => {
+            collect_cols(left, out);
+            collect_cols(right, out);
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => collect_cols(expr, out),
+        Expr::Aggregate { arg, .. } => {
+            if let Some(a) = arg {
+                collect_cols(a, out);
+            }
+        }
+        Expr::Literal(_) => {}
+    }
+}
+
+/// Which relations (as a bitmask) a predicate references.
+fn rel_refs(e: &Expr, rels: &[Rel]) -> u32 {
+    let mut cols = Vec::new();
+    collect_cols(e, &mut cols);
+    let mut mask = 0u32;
+    for (table, name) in &cols {
+        for (i, rel) in rels.iter().enumerate() {
+            let has = rel.schema.column_index(name).is_some();
+            let alias_ok = table
+                .as_deref()
+                .is_none_or(|t| t.eq_ignore_ascii_case(&rel.alias));
+            if has && alias_ok {
+                mask |= 1 << i;
+            }
+        }
+    }
+    mask
+}
+
+/// A rough selectivity estimate for a predicate (fraction of rows kept).
+fn selectivity(e: &Expr) -> f64 {
+    match e {
+        Expr::Binary { op: BinOp::Eq, .. } => 0.1,
+        Expr::Binary { op: BinOp::Ne, .. } => 0.9,
+        Expr::Binary {
+            op: BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
+            ..
+        } => 0.33,
+        Expr::Binary {
+            op: BinOp::And,
+            left,
+            right,
+        } => selectivity(left) * selectivity(right),
+        Expr::Binary {
+            op: BinOp::Or,
+            left,
+            right,
+        } => (selectivity(left) + selectivity(right)).min(1.0),
+        _ => 0.5,
+    }
+}
+
+fn is_const(e: &Expr) -> bool {
+    let mut cols = Vec::new();
+    collect_cols(e, &mut cols);
+    cols.is_empty()
+}
+
+/// If `conj` is a sargable `pk = const` on `rel`, return the constant key expression.
+fn pk_seek_key(conj: &Expr, rel: &Rel) -> Option<Expr> {
+    let pk = rel.schema.pk_index()?;
+    let pk_name = &rel.schema.columns[pk].name;
+    let is_pk = |e: &Expr| {
+        matches!(e, Expr::Column { table, name }
+            if name.eq_ignore_ascii_case(pk_name)
+            && table.as_deref().is_none_or(|t| t.eq_ignore_ascii_case(&rel.alias)))
+    };
+    if let Expr::Binary {
+        op: BinOp::Eq,
+        left,
+        right,
+    } = conj
+    {
+        if is_pk(left) && is_const(right) {
+            return Some((**right).clone());
+        }
+        if is_pk(right) && is_const(left) {
+            return Some((**left).clone());
+        }
+    }
+    None
+}
+
+/// Build a base-relation scan, choosing a PK index seek when possible and
+/// attaching any remaining single-relation predicates as a pushed-down filter.
+fn scan_with_pushdown(rel: &Rel, pushed: &[Expr]) -> (Plan, f64) {
+    let mut remaining: Vec<Expr> = pushed.to_vec();
+    let mut est = rel.est;
+    let access = if let Some((idx, key)) = remaining
+        .iter()
+        .enumerate()
+        .find_map(|(j, c)| pk_seek_key(c, rel).map(|k| (j, k)))
+    {
+        remaining.remove(idx);
+        est = 1.0;
+        Access::IndexSeek { op: BinOp::Eq, key }
+    } else {
+        for c in &remaining {
+            est *= selectivity(c);
+        }
+        est = est.max(1.0);
+        Access::Seq
+    };
+    let plan = Plan::Scan {
+        table: rel.table.clone(),
+        alias: rel.alias.clone(),
+        access,
+        filter: and_all(&remaining),
+        est,
+    };
+    (plan, est)
+}
+
+/// Written-order left-deep plan (used when a `LEFT` join blocks reordering).
+fn build_join_tree_baseline(rels: &[Rel], sel: &Select) -> Plan {
+    let mut node = scan_plan(&rels[0]);
+    let mut left_cols = cols_of(&rels[0]);
+    for (i, join) in sel.joins.iter().enumerate() {
+        let right = &rels[i + 1];
+        let right_cols = cols_of(right);
+        let hash_keys = planner::detect_hash_keys(&join.on, &left_cols, &right_cols);
+        let est = if hash_keys.is_some() {
+            node.est().max(right.est)
+        } else {
+            node.est().max(1.0) * right.est.max(1.0) * 0.3
+        };
+        node = Plan::Join {
+            left: Box::new(node),
+            right: Box::new(scan_plan(right)),
+            jt: join.join_type,
+            on: join.on.clone(),
+            hash_keys,
+            est,
+        };
+        left_cols.extend(right_cols);
+    }
+    if let Some(pred) = &sel.filter {
+        let est = node.est() * 0.3;
+        node = Plan::Filter {
+            input: Box::new(node),
+            pred: pred.clone(),
+            est,
+        };
+    }
+    node
+}
+
+/// System-R-style cost-based left-deep plan for an all-`INNER` query.
+///
+/// All `ON` and `WHERE` conjuncts are pooled: single-relation conjuncts are
+/// pushed to scans, the rest become join predicates. A DP over relation subsets
+/// minimises the summed intermediate-result size; each join applies the
+/// predicates that first connect its two sides (hash join when one is an equi).
+fn build_join_tree_optimized(rels: &[Rel], sel: &Select) -> Plan {
+    let n = rels.len();
+
+    // Pool every conjunct and classify by the relations it references.
+    let mut conjuncts = Vec::new();
+    if let Some(f) = &sel.filter {
+        split_and(f, &mut conjuncts);
+    }
+    for j in &sel.joins {
+        split_and(&j.on, &mut conjuncts);
+    }
+    let mut pushed: Vec<Vec<Expr>> = vec![Vec::new(); n];
+    let mut constants: Vec<Expr> = Vec::new();
+    let mut join_preds: Vec<(u32, Expr)> = Vec::new();
+    for c in conjuncts {
+        let refs = rel_refs(&c, rels);
+        match refs.count_ones() {
+            0 => constants.push(c),
+            1 => pushed[refs.trailing_zeros() as usize].push(c),
+            _ => join_preds.push((refs, c)),
+        }
+    }
+
+    // Singleton access paths.
+    let mut plans: Vec<Option<(f64, f64, Plan)>> = vec![None; 1 << n]; // (cost, est, plan)
+    let mut single_cols: Vec<Vec<Col>> = Vec::with_capacity(n);
+    for (i, rel) in rels.iter().enumerate() {
+        single_cols.push(cols_of(rel));
+        let (plan, est) = scan_with_pushdown(rel, &pushed[i]);
+        plans[1 << i] = Some((0.0, est, plan));
+    }
+
+    // DP over subsets: right side is always a single relation (left-deep).
+    for mask in 1u32..(1 << n) {
+        if mask.count_ones() < 2 {
+            continue;
+        }
+        let mut best: Option<(f64, f64, Plan)> = None;
+        for r in 0..n {
+            let r_bit = 1u32 << r;
+            if mask & r_bit == 0 {
+                continue;
+            }
+            let left_mask = mask & !r_bit;
+            let Some((left_cost, left_est, left_plan)) = &plans[left_mask as usize] else {
+                continue;
+            };
+            let Some((_, right_est, right_plan)) = &plans[r_bit as usize] else {
+                continue;
+            };
+
+            // Predicates that first connect `left_mask` and `r`.
+            let applicable: Vec<Expr> = join_preds
+                .iter()
+                .filter(|(refs, _)| refs & !mask == 0 && refs & left_mask != 0 && refs & r_bit != 0)
+                .map(|(_, e)| e.clone())
+                .collect();
+
+            let sel_factor: f64 = applicable.iter().map(selectivity).product();
+            let est = (left_est * right_est * sel_factor).max(1.0);
+            let cost = left_cost + est;
+
+            if best.as_ref().is_none_or(|(bc, _, _)| cost < *bc) {
+                let left_cols: Vec<Col> = (0..n)
+                    .filter(|i| left_mask & (1 << i) != 0)
+                    .flat_map(|i| single_cols[i].clone())
+                    .collect();
+                let hash_keys = applicable
+                    .iter()
+                    .find_map(|p| planner::detect_hash_keys(p, &left_cols, &single_cols[r]));
+                let on = and_all(&applicable).unwrap_or(Expr::Literal(Value::Boolean(true)));
+                let plan = Plan::Join {
+                    left: Box::new(left_plan.clone()),
+                    right: Box::new(right_plan.clone()),
+                    jt: JoinType::Inner,
+                    on,
+                    hash_keys,
+                    est,
+                };
+                best = Some((cost, est, plan));
+            }
+        }
+        plans[mask as usize] = best;
+    }
+
+    let (_, _, mut node) = plans[(1 << n) - 1]
+        .clone()
+        .expect("a full-set plan always exists");
+
+    // Constant predicates (no relation references) apply as a top filter.
+    if let Some(pred) = and_all(&constants) {
+        let est = node.est();
+        node = Plan::Filter {
+            input: Box::new(node),
+            pred,
+            est,
+        };
+    }
+    node
 }
 
 /// Expand `SELECT` items into projection expressions and output column names,

@@ -127,6 +127,22 @@ fn group_by_with_having() {
 }
 
 #[test]
+fn order_by_aggregate_alias() {
+    let mut db = users_and_orders();
+    // al spent 150, sam spent 70; order by the SUM alias descending
+    let out = db
+        .execute(
+            "SELECT u.name, SUM(o.total) AS spent FROM users u \
+             JOIN orders o ON u.id = o.user_id GROUP BY u.name ORDER BY spent DESC",
+        )
+        .unwrap();
+    assert_eq!(
+        rows(out),
+        vec![vec![text("al"), int(150)], vec![text("sam"), int(70)]]
+    );
+}
+
+#[test]
 fn count_skips_nulls_but_count_star_does_not() {
     let mut db = fresh_db();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
@@ -146,6 +162,78 @@ fn global_aggregate_over_empty_table() {
         .unwrap();
     let out = db.execute("SELECT COUNT(*), SUM(v) FROM t").unwrap();
     assert_eq!(rows(out), vec![vec![int(0), Value::Null]]);
+}
+
+fn explain_text(db: &mut Database, sql: &str) -> String {
+    rows(db.execute(sql).unwrap())
+        .into_iter()
+        .map(|r| match &r[0] {
+            Value::Text(s) => s.clone(),
+            _ => panic!(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn index_seek_for_primary_key_equality() {
+    let mut db = users_and_orders();
+    let seek = explain_text(&mut db, "EXPLAIN SELECT * FROM users WHERE id = 2");
+    assert!(
+        seek.contains("IndexSeek users (pk = 2)"),
+        "plan was:\n{seek}"
+    );
+    // a non-PK predicate cannot use the index
+    let scan = explain_text(&mut db, "EXPLAIN SELECT * FROM users WHERE name = 'al'");
+    assert!(scan.contains("SeqScan users"), "plan was:\n{scan}");
+    assert!(scan.contains("filter: name = 'al'"), "plan was:\n{scan}");
+    // and it still returns the right row
+    assert_eq!(
+        rows(db.execute("SELECT name FROM users WHERE id = 2").unwrap()),
+        vec![vec![text("sam")]]
+    );
+}
+
+#[test]
+fn single_table_predicate_is_pushed_to_the_scan() {
+    let mut db = users_and_orders();
+    let plan = explain_text(
+        &mut db,
+        "EXPLAIN SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id WHERE u.name = 'al'",
+    );
+    // the u-only predicate rides on the users scan, not a separate Filter node
+    assert!(plan.contains("filter: u.name = 'al'"), "plan was:\n{plan}");
+}
+
+#[test]
+fn join_order_avoids_leading_with_the_big_table() {
+    let mut db = fresh_db();
+    db.execute("CREATE TABLE big (id INTEGER PRIMARY KEY, k INTEGER)")
+        .unwrap();
+    db.execute("CREATE TABLE mid (id INTEGER PRIMARY KEY, k INTEGER, j INTEGER)")
+        .unwrap();
+    db.execute("CREATE TABLE small (id INTEGER PRIMARY KEY, j INTEGER)")
+        .unwrap();
+    for i in 1..=100 {
+        db.execute(&format!("INSERT INTO big VALUES ({i}, {})", i % 10))
+            .unwrap();
+    }
+    for i in 1..=10 {
+        db.execute(&format!("INSERT INTO mid VALUES ({i}, {}, {i})", i % 10))
+            .unwrap();
+    }
+    db.execute("INSERT INTO small VALUES (1, 5)").unwrap();
+
+    // chain: big.k = mid.k, mid.j = small.j
+    let plan = explain_text(
+        &mut db,
+        "EXPLAIN SELECT big.id FROM big \
+         JOIN mid ON big.k = mid.k JOIN small ON mid.j = small.j",
+    );
+    let big_at = plan.find("SeqScan big").expect("big scanned");
+    let small_at = plan.find("SeqScan small").expect("small scanned");
+    // leading with the 100-row table is the expensive plan; the optimizer avoids it
+    assert!(small_at < big_at, "optimizer led with big:\n{plan}");
 }
 
 #[test]
