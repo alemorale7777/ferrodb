@@ -1,0 +1,16 @@
+[package]
+name = "ferrodb-bench"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ferrodb-bench"
+path = "src/main.rs"
+
+[dependencies]
+engine = { path = "../engine" }
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
+
+[features]
+# Build with `--features sqlite` to include the SQLite comparison columns.
+sqlite = ["dep:rusqlite"]

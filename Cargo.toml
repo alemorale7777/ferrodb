@@ -7,4 +7,5 @@ members = [
     "crates/cli",
     "crates/pgwire",
     "crates/wasm",
+    "crates/bench",
 ]
