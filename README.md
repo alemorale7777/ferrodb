@@ -5,9 +5,36 @@ indexes, write-ahead logging with crash recovery, MVCC transactions, a cost-base
 planner, and the PostgreSQL wire protocol. No third-party SQL parser, storage engine, or
 B+-tree crate: the point is to build the machine, not glue one together.
 
-> **Status:** Milestones 1–4 complete and green — it runs real SQL, persisted to
-> disk, survives a crash, and gives concurrent transactions snapshot isolation. See the
+> **Status:** Milestones 1–5 complete and green — it runs real SQL with joins and
+> grouped aggregation, persisted to disk, survives a crash, gives concurrent transactions
+> snapshot isolation, and plans queries with a cost-based optimizer. See the
 > [full design & roadmap](docs/superpowers/specs/2026-07-02-ferrodb-design.md).
+
+## Milestone 5 — Joins, aggregates & a cost-based optimizer ✅
+
+A real query engine on a physical **plan tree**: `INNER` / `LEFT` joins, `GROUP BY` / `HAVING`,
+`COUNT / SUM / AVG / MIN / MAX`, qualified columns and aliases. The **cost-based optimizer** pushes
+single-table predicates down to scans, picks a **PK index seek** over a full scan when a `pk = const`
+predicate is available, and orders joins (System-R-style DP over relation subsets) to minimise
+estimated intermediate cardinality — so it never leads with the biggest table. Equijoins run as
+**hash joins**. `EXPLAIN` prints the chosen plan:
+
+```sql
+EXPLAIN SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = 1;
+```
+```
++----------------------------------------------------+
+| QUERY PLAN                                         |
++----------------------------------------------------+
+| Project [u.name AS name]  (rows≈1)                 |
+|   HashJoin [Inner] on u.id = o.user_id  (rows≈1)   |
+|     SeqScan orders o  (rows≈3)                     |
+|     IndexSeek users u (pk = 1)  (rows≈1)           |
++----------------------------------------------------+
+```
+
+The optimizer recognised the `pk = 1` predicate as an index seek and made that one-row relation the
+build side of the join. Proven by `crates/engine/tests/query.rs`.
 
 ## Milestone 4 — MVCC transactions ✅
 
@@ -110,7 +137,7 @@ Built bottom-up; each milestone is an independently testable, demoable artifact.
 | **M2** | **SQL frontend + executor** ✅ | lexer → Pratt parser → binder → volcano executor |
 | **M3** | **WAL + crash recovery** ✅ | no-steal redo log; crash mid-write, restart, data intact |
 | **M4** | **MVCC transactions** ✅ | version chains; snapshot isolation · `BEGIN`/`COMMIT`/`ROLLBACK` · write conflicts · `VACUUM` |
-| M5 | Cost-based optimizer | statistics · join ordering · index selection · `EXPLAIN` |
+| **M5** | **Joins, aggregates & cost-based optimizer** ✅ | hash/nested-loop joins · `GROUP BY`/`HAVING` · predicate pushdown · PK index seeks · join ordering · `EXPLAIN` |
 | M6 | PostgreSQL wire protocol | connect with real `psql` |
 | M7 | WASM web playground | in-browser engine + live B+-tree visualizer |
 | M8 | Benchmarks + docs | SQLite comparison · mdBook architecture book |
@@ -120,7 +147,7 @@ Built bottom-up; each milestone is an independently testable, demoable artifact.
 ```
 crates/storage   disk · buffer pool · slotted pages · B+-tree · WAL + recovery
 crates/sql       lexer · Pratt parser · AST
-crates/engine    catalog · tuple codec · evaluator · executor · Database/execute
+crates/engine    catalog · tuple codec · evaluator · MVCC · planner + optimizer · executor
 crates/cli       ferrodb-kv (raw KV) + ferrodb (SQL shell)
 docs/            design spec + implementation plans
 ```
