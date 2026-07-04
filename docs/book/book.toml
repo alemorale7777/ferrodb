@@ -1,0 +1,10 @@
+[book]
+title = "ferrodb — Building a Database from Scratch"
+authors = ["ferrodb"]
+description = "An architecture tour of a relational database written from scratch in Rust: pager, B+-tree, WAL, MVCC, SQL, a cost-based optimizer, the PostgreSQL wire protocol, and WebAssembly."
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "navy"
+git-repository-url = "https://github.com/alemorale7777/ferrodb"
