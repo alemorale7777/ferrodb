@@ -1,0 +1,19 @@
+[package]
+name = "pgwire"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "pgwire"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ferrodb-pg"
+path = "src/main.rs"
+
+[dependencies]
+engine = { path = "../engine" }
+sql = { path = "../sql" }
+
+[dev-dependencies]
+tempfile = "3"
