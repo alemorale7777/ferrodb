@@ -5,11 +5,30 @@ indexes, write-ahead logging with crash recovery, MVCC transactions, a cost-base
 planner, and the PostgreSQL wire protocol. No third-party SQL parser, storage engine, or
 B+-tree crate: the point is to build the machine, not glue one together.
 
-> **Status:** Milestones 1–6 complete and green — it runs real SQL with joins and
+> **Status:** Milestones 1–7 complete and green — it runs real SQL with joins and
 > grouped aggregation, persisted to disk, survives a crash, gives concurrent transactions
-> snapshot isolation, plans queries with a cost-based optimizer, and speaks the
-> **PostgreSQL wire protocol** so `psql` can connect. See the
+> snapshot isolation, plans queries with a cost-based optimizer, speaks the
+> **PostgreSQL wire protocol** so `psql` can connect, and compiles to **WebAssembly** to run
+> in the browser. See the
 > [full design & roadmap](docs/superpowers/specs/2026-07-02-ferrodb-design.md).
+
+## Milestone 7 — WebAssembly playground & B+-tree visualizer ✅
+
+The whole engine — storage, SQL, MVCC, the optimizer — compiles to **WebAssembly** and runs
+entirely in the browser, with a **live B+-tree visualizer** that shows the tree split as you insert
+rows:
+
+```console
+$ cd web && ./build.sh && python -m http.server 8000   # then open localhost:8000
+```
+
+`crates/wasm` is a `cdylib` over `wasm32-unknown-unknown` with a **hand-written C ABI — no
+`wasm-bindgen`, no dependencies**; strings cross the boundary as length-prefixed buffers read
+straight out of wasm memory. This is possible because the storage layer was decoupled from the
+filesystem: `DiskManager` and the WAL now sit on a `Blob` trait (a real `File` natively, a `Vec<u8>`
+`MemBlob` in the browser), so `Database::open_in_memory()` needs no files at all. The ~383 KB module
+instantiates with **zero imports** and drives `CREATE`/`INSERT`/`SELECT`/`EXPLAIN` plus a B+-tree
+export that `web/index.html` lays out as SVG — inserting rows animates real node splits.
 
 ## Milestone 6 — PostgreSQL wire protocol ✅
 
@@ -160,7 +179,7 @@ Built bottom-up; each milestone is an independently testable, demoable artifact.
 | **M4** | **MVCC transactions** ✅ | version chains; snapshot isolation · `BEGIN`/`COMMIT`/`ROLLBACK` · write conflicts · `VACUUM` |
 | **M5** | **Joins, aggregates & cost-based optimizer** ✅ | hash/nested-loop joins · `GROUP BY`/`HAVING` · predicate pushdown · PK index seeks · join ordering · `EXPLAIN` |
 | **M6** | **PostgreSQL wire protocol** ✅ | connect with real `psql`; simple query · transactions · hand-rolled v3 framing |
-| M7 | WASM web playground | in-browser engine + live B+-tree visualizer |
+| **M7** | **WASM web playground** ✅ | in-browser engine (hand-rolled C ABI) + live B+-tree visualizer |
 | M8 | Benchmarks + docs | SQLite comparison · mdBook architecture book |
 
 ## Layout
@@ -170,7 +189,9 @@ crates/storage   disk · buffer pool · slotted pages · B+-tree · WAL + recove
 crates/sql       lexer · Pratt parser · AST
 crates/engine    catalog · tuple codec · evaluator · MVCC · planner + optimizer · executor
 crates/pgwire    PostgreSQL wire protocol server (ferrodb-pg)
+crates/wasm      WebAssembly bindings (hand-written C ABI, no wasm-bindgen)
 crates/cli       ferrodb-kv (raw KV) + ferrodb (SQL shell)
+web/             browser playground + live B+-tree visualizer
 docs/            design spec + implementation plans
 ```
 
