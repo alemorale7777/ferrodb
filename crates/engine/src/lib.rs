@@ -1,18 +1,21 @@
-//! ferrodb SQL engine: parse → resolve → execute SQL against the M1 storage
-//! engine. Single-table volcano-style execution; transactions/joins/optimizer
-//! arrive in later milestones.
+//! ferrodb SQL engine with MVCC transactions.
+//!
+//! Each row key maps to a version chain ([`mvcc`]); transactions ([`txn`]) get a
+//! snapshot at `begin` and see a consistent view. Statements run inside a
+//! transaction (explicit `begin`/`commit_txn`/`rollback_txn`, or autocommit via
+//! [`Database::execute`]). Durability rides on the M3 WAL.
 
 pub mod catalog;
 pub mod eval;
+pub mod mvcc;
 pub mod tuple;
+pub mod txn;
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use sql::ast::{DataType, Expr, SelectItem, Statement, Value};
-
-// Re-exported so consumers can render results without depending on `sql` directly.
-pub use sql::ast::Value as SqlValue;
 use storage::btree::tree::{load_meta, BPlusTree};
 use storage::buffer::BufferPool;
 use storage::disk::DiskManager;
@@ -21,8 +24,17 @@ use storage::page::PageId;
 use storage::wal::Wal;
 
 use catalog::{ColumnInfo, TableSchema};
+use mvcc::Version;
+use txn::{Status, TxnManager};
+
+/// A row key paired with its decoded version chain.
+type KeyedChain = (Vec<u8>, Vec<Version>);
 
 use thiserror::Error;
+
+// Re-exported so consumers can render results without depending on `sql` directly.
+pub use sql::ast::Value as SqlValue;
+pub use txn::TxnId;
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -40,6 +52,8 @@ pub enum EngineError {
     Type(String),
     #[error("constraint violation: {0}")]
     Constraint(String),
+    #[error("write conflict: {0}")]
+    Conflict(String),
     #[error("unsupported: {0}")]
     Unsupported(String),
     #[error("{0}")]
@@ -57,12 +71,13 @@ pub enum Output {
     Ack(&'static str),
 }
 
-/// A single-file SQL database with write-ahead logging for crash recovery.
+/// A single-file, MVCC, crash-safe SQL database.
 pub struct Database {
     bp: BufferPool,
     meta: MetaPage,
     wal: Wal,
-    next_txn: u64,
+    mgr: TxnManager,
+    write_sets: HashMap<TxnId, Vec<(String, Vec<u8>)>>,
 }
 
 impl Database {
@@ -72,23 +87,117 @@ impl Database {
         wal_name.push(".wal");
         let wal_path = PathBuf::from(wal_name);
 
-        // Recover any committed-but-unflushed work before reading the catalog.
         let mut dm = DiskManager::open(data_path)?;
         let mut wal = Wal::open(&wal_path)?;
         wal.recover(&mut dm)?;
 
         let mut bp = BufferPool::new(dm, 256);
-        bp.set_no_steal(true); // WAL recovery requires no-steal
+        bp.set_no_steal(true);
         let meta = load_meta(&mut bp)?;
-        Ok(Database {
+        let mut db = Database {
             bp,
             meta,
             wal,
-            next_txn: 1,
-        })
+            mgr: TxnManager::new(1),
+            write_sets: HashMap::new(),
+        };
+        // Resume transaction ids past anything already stored (derived, not persisted).
+        let next = db.max_txn_id()? + 1;
+        db.mgr = TxnManager::new(next);
+        Ok(db)
     }
 
-    /// Flush all pages and persist the meta record. Call before dropping.
+    // ---- transaction control ---------------------------------------------
+
+    /// Begin a transaction and return its id.
+    pub fn begin(&mut self) -> TxnId {
+        let id = self.mgr.begin();
+        self.write_sets.insert(id, Vec::new());
+        id
+    }
+
+    /// Run a statement inside transaction `txn` (no commit).
+    pub fn execute_in(&mut self, txn: TxnId, sql: &str) -> Result<Output, EngineError> {
+        let stmt = sql::parse(sql)?;
+        self.dispatch(txn, stmt)
+    }
+
+    /// Commit `txn`: freeze its hint bits, then durably persist (WAL + force).
+    pub fn commit_txn(&mut self, txn: TxnId) -> Result<(), EngineError> {
+        self.finalize_hints(txn)?;
+        self.mgr.commit(txn);
+        if self.bp.has_dirty() {
+            self.wal_commit(txn)?;
+            self.force_data()?;
+        }
+        self.write_sets.remove(&txn);
+        Ok(())
+    }
+
+    /// Roll back `txn`: mark it aborted. Its versions are invisible; no undo needed.
+    pub fn rollback_txn(&mut self, txn: TxnId) -> Result<(), EngineError> {
+        self.mgr.abort(txn);
+        self.write_sets.remove(&txn);
+        Ok(())
+    }
+
+    /// Run a single statement as its own autocommit transaction.
+    pub fn execute(&mut self, sql: &str) -> Result<Output, EngineError> {
+        let txn = self.begin();
+        match self.execute_in(txn, sql) {
+            Ok(out) => {
+                self.commit_txn(txn)?;
+                Ok(out)
+            }
+            Err(e) => {
+                self.rollback_txn(txn)?;
+                Err(e)
+            }
+        }
+    }
+
+    /// Reclaim versions that are dead to every live snapshot.
+    pub fn vacuum(&mut self) -> Result<Output, EngineError> {
+        let horizon = self.mgr.oldest_active();
+        let mut removed = 0usize;
+        for table in catalog::list_tables(&mut self.bp, &self.meta)? {
+            let mut schema = self.schema_of(&table)?;
+            for (key, chain) in self.table_scan(schema.root)? {
+                let before = chain.len();
+                let kept: Vec<Version> = chain
+                    .into_iter()
+                    .filter(|v| !self.is_dead(v, horizon))
+                    .collect();
+                if kept.len() != before {
+                    removed += before - kept.len();
+                    self.table_put_chain(&mut schema, &key, &kept)?;
+                }
+            }
+        }
+        if self.bp.has_dirty() {
+            let txn = self.mgr.begin();
+            self.mgr.commit(txn);
+            self.wal_commit(txn)?;
+            self.force_data()?;
+        }
+        Ok(Output::Affected(removed))
+    }
+
+    fn is_dead(&self, v: &Version, horizon: TxnId) -> bool {
+        // created by an aborted txn, or deleted-committed before any live snapshot
+        matches!(self.mgr.known_status(v.xmin), Some(Status::Aborted))
+            || (v.xmax != 0
+                && mvcc::is_live_delete(&self.mgr, v.xmax, v.xmax_committed)
+                && !self.mgr.is_active(v.xmax)
+                && v.xmax < horizon)
+    }
+
+    /// Names of all user tables.
+    pub fn list_tables(&mut self) -> Result<Vec<String>, EngineError> {
+        catalog::list_tables(&mut self.bp, &self.meta)
+    }
+
+    /// Flush all pages and persist the meta record.
     pub fn checkpoint(&mut self) -> Result<(), EngineError> {
         self.bp.flush_all()?;
         let mut mp = self.meta.encode();
@@ -97,37 +206,9 @@ impl Database {
         Ok(())
     }
 
-    /// Parse and execute a single SQL statement as its own autocommit transaction.
-    /// On success the statement is durable (WAL + data flushed); on error it is
-    /// rolled back entirely, leaving the database at its prior committed state.
-    pub fn execute(&mut self, sql: &str) -> Result<Output, EngineError> {
-        let stmt = sql::parse(sql)?;
-        let saved = self.meta; // MetaPage: Copy — statement-start snapshot for rollback
-        let txn = self.next_txn;
-        self.next_txn += 1;
-        match self.dispatch(stmt) {
-            Ok(out) => {
-                // Read-only statements dirty nothing — skip the commit fsync.
-                if self.bp.has_dirty() {
-                    self.commit(txn)?;
-                }
-                Ok(out)
-            }
-            Err(e) => {
-                self.meta = saved;
-                self.bp.discard_dirty()?;
-                Err(e)
-            }
-        }
-    }
+    // ---- durability (WAL) -------------------------------------------------
 
-    fn commit(&mut self, txn: u64) -> Result<(), EngineError> {
-        self.wal_commit(txn)?;
-        self.force_data()
-    }
-
-    /// Log the transaction's dirty pages + meta, then a commit record, then fsync.
-    fn wal_commit(&mut self, txn: u64) -> Result<(), EngineError> {
+    fn wal_commit(&mut self, txn: TxnId) -> Result<(), EngineError> {
         for (pid, page) in self.bp.dirty_frames() {
             self.wal.append_update(txn, pid, &page)?;
         }
@@ -138,7 +219,6 @@ impl Database {
         Ok(())
     }
 
-    /// Force dirty data pages + meta to the data file, then clear the WAL.
     fn force_data(&mut self) -> Result<(), EngineError> {
         self.bp.flush_all()?;
         let mut mp = self.meta.encode();
@@ -148,8 +228,97 @@ impl Database {
         Ok(())
     }
 
-    /// Execute a parsed statement, mutating in-memory state without committing.
-    fn dispatch(&mut self, stmt: Statement) -> Result<Output, EngineError> {
+    /// Set the committed hint bits for every version this transaction touched.
+    fn finalize_hints(&mut self, txn: TxnId) -> Result<(), EngineError> {
+        let ws = self.write_sets.get(&txn).cloned().unwrap_or_default();
+        for (table, key) in ws {
+            let mut schema = match catalog::get_table(&mut self.bp, &self.meta, &table)? {
+                Some(s) => s,
+                None => continue,
+            };
+            if let Some(chain) = self.table_get_chain(schema.root, &key)? {
+                let mut chain = chain;
+                let mut changed = false;
+                for v in &mut chain {
+                    if v.xmin == txn && !v.xmin_committed {
+                        v.xmin_committed = true;
+                        changed = true;
+                    }
+                    if v.xmax == txn && !v.xmax_committed {
+                        v.xmax_committed = true;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    self.table_put_chain(&mut schema, &key, &chain)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn max_txn_id(&mut self) -> Result<TxnId, EngineError> {
+        let mut max = 0u64;
+        for table in catalog::list_tables(&mut self.bp, &self.meta)? {
+            let schema = self.schema_of(&table)?;
+            for (_k, chain) in self.table_scan(schema.root)? {
+                for v in chain {
+                    max = max.max(v.xmin).max(v.xmax);
+                }
+            }
+        }
+        Ok(max)
+    }
+
+    // ---- chain storage helpers -------------------------------------------
+
+    fn table_get_chain(
+        &mut self,
+        root: PageId,
+        key: &[u8],
+    ) -> Result<Option<Vec<Version>>, EngineError> {
+        let raw = {
+            let mut tree = BPlusTree::open_at(&mut self.bp, root);
+            tree.get(key)?
+        };
+        Ok(raw.map(|b| mvcc::decode_chain(&b)))
+    }
+
+    fn table_put_chain(
+        &mut self,
+        schema: &mut TableSchema,
+        key: &[u8],
+        chain: &[Version],
+    ) -> Result<(), EngineError> {
+        let bytes = mvcc::encode_chain(chain);
+        {
+            let mut tree = BPlusTree::open_at(&mut self.bp, schema.root);
+            tree.insert(key, &bytes)?;
+            schema.root = tree.root();
+        }
+        catalog::put_table(&mut self.bp, &mut self.meta, schema)?;
+        Ok(())
+    }
+
+    fn table_scan(&mut self, root: PageId) -> Result<Vec<KeyedChain>, EngineError> {
+        let raw = {
+            let mut tree = BPlusTree::open_at(&mut self.bp, root);
+            tree.scan(None, None)?
+        };
+        Ok(raw
+            .into_iter()
+            .map(|(k, b)| (k, mvcc::decode_chain(&b)))
+            .collect())
+    }
+
+    fn schema_of(&mut self, name: &str) -> Result<TableSchema, EngineError> {
+        catalog::get_table(&mut self.bp, &self.meta, name)?
+            .ok_or_else(|| EngineError::UnknownTable(name.to_string()))
+    }
+
+    // ---- dispatch ---------------------------------------------------------
+
+    fn dispatch(&mut self, txn: TxnId, stmt: Statement) -> Result<Output, EngineError> {
         match stmt {
             Statement::CreateTable { name, columns } => self.exec_create(name, columns),
             Statement::DropTable { name } => self.exec_drop(name),
@@ -157,7 +326,7 @@ impl Database {
                 table,
                 columns,
                 rows,
-            } => self.exec_insert(table, columns, rows),
+            } => self.exec_insert(txn, table, columns, rows),
             Statement::Select {
                 items,
                 from,
@@ -165,24 +334,14 @@ impl Database {
                 order_by,
                 limit,
                 offset,
-            } => self.exec_select(items, from, filter, order_by, limit, offset),
+            } => self.exec_select(txn, items, from, filter, order_by, limit, offset),
             Statement::Update {
                 table,
                 assignments,
                 filter,
-            } => self.exec_update(table, assignments, filter),
-            Statement::Delete { table, filter } => self.exec_delete(table, filter),
+            } => self.exec_update(txn, table, assignments, filter),
+            Statement::Delete { table, filter } => self.exec_delete(txn, table, filter),
         }
-    }
-
-    /// Names of all user tables.
-    pub fn list_tables(&mut self) -> Result<Vec<String>, EngineError> {
-        catalog::list_tables(&mut self.bp, &self.meta)
-    }
-
-    fn schema_of(&mut self, name: &str) -> Result<TableSchema, EngineError> {
-        catalog::get_table(&mut self.bp, &self.meta, name)?
-            .ok_or_else(|| EngineError::UnknownTable(name.to_string()))
     }
 
     // ---- DDL --------------------------------------------------------------
@@ -219,7 +378,6 @@ impl Database {
     }
 
     fn exec_drop(&mut self, name: String) -> Result<Output, EngineError> {
-        // NB: M2 leaks the table's data pages; page reclamation lands with M4 VACUUM.
         if catalog::drop_table(&mut self.bp, &mut self.meta, &name)? {
             Ok(Output::Ack("DROP TABLE"))
         } else {
@@ -231,17 +389,18 @@ impl Database {
 
     fn exec_insert(
         &mut self,
+        txn: TxnId,
         table: String,
         columns: Option<Vec<String>>,
         rows: Vec<Vec<Expr>>,
     ) -> Result<Output, EngineError> {
         let mut schema = self.schema_of(&table)?;
+        let snap = self.mgr.snapshot(txn).clone();
         let ncols = schema.columns.len();
         let empty = empty_schema();
         let mut count = 0;
 
         for exprs in rows {
-            // build the full row in table-column order
             let mut row: Vec<Value> = vec![Value::Null; ncols];
             let mut provided = vec![false; ncols];
             match &columns {
@@ -255,8 +414,7 @@ impl Database {
                         let idx = schema
                             .column_index(cname)
                             .ok_or_else(|| EngineError::UnknownColumn(cname.clone()))?;
-                        let v = eval::eval(e, &empty, &[])?;
-                        row[idx] = coerce(v, &schema.columns[idx])?;
+                        row[idx] = coerce(eval::eval(e, &empty, &[])?, &schema.columns[idx])?;
                         provided[idx] = true;
                     }
                 }
@@ -267,13 +425,11 @@ impl Database {
                         ));
                     }
                     for (i, e) in exprs.iter().enumerate() {
-                        let v = eval::eval(e, &empty, &[])?;
-                        row[i] = coerce(v, &schema.columns[i])?;
+                        row[i] = coerce(eval::eval(e, &empty, &[])?, &schema.columns[i])?;
                         provided[i] = true;
                     }
                 }
             }
-            // NOT NULL check for columns left unset
             for (i, c) in schema.columns.iter().enumerate() {
                 if !provided[i] && c.not_null {
                     return Err(EngineError::Constraint(format!(
@@ -283,7 +439,6 @@ impl Database {
                 }
             }
 
-            // key: primary key value, or a hidden auto-increment row id
             let key = match schema.pk_index() {
                 Some(pk) => tuple::value_to_key(&row[pk])?,
                 None => {
@@ -292,21 +447,29 @@ impl Database {
                     k
                 }
             };
-            let encoded = tuple::encode_tuple(&row);
-            let mut tree = BPlusTree::open_at(&mut self.bp, schema.root);
-            tree.insert(&key, &encoded)?;
-            schema.root = tree.root();
+            let mut chain = self.table_get_chain(schema.root, &key)?.unwrap_or_default();
+            if schema.pk_index().is_some()
+                && mvcc::visible_index(&chain, &snap, &self.mgr).is_some()
+            {
+                return Err(EngineError::Constraint("duplicate primary key".into()));
+            }
+            chain.push(Version::new(txn, tuple::encode_tuple(&row)));
+            self.table_put_chain(&mut schema, &key, &chain)?;
+            self.write_sets
+                .get_mut(&txn)
+                .expect("active txn")
+                .push((table.clone(), key));
             count += 1;
         }
-
-        catalog::put_table(&mut self.bp, &mut self.meta, &schema)?;
         Ok(Output::Affected(count))
     }
 
     // ---- SELECT -----------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     fn exec_select(
         &mut self,
+        txn: TxnId,
         items: Vec<SelectItem>,
         from: String,
         filter: Option<Expr>,
@@ -315,20 +478,16 @@ impl Database {
         offset: Option<u64>,
     ) -> Result<Output, EngineError> {
         let schema = self.schema_of(&from)?;
+        let snap = self.mgr.snapshot(txn).clone();
         let types = schema.types();
 
-        // SeqScan → decode
-        let mut rows: Vec<Vec<Value>> = {
-            let mut tree = BPlusTree::open_at(&mut self.bp, schema.root);
-            let raw = tree.scan(None, None)?;
-            let mut out = Vec::with_capacity(raw.len());
-            for (_k, bytes) in raw {
-                out.push(tuple::decode_tuple(&types, &bytes)?);
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for (_key, chain) in self.table_scan(schema.root)? {
+            if let Some(i) = mvcc::visible_index(&chain, &snap, &self.mgr) {
+                rows.push(tuple::decode_tuple(&types, &chain[i].data)?);
             }
-            out
-        };
+        }
 
-        // Filter
         if let Some(pred) = &filter {
             let mut kept = Vec::new();
             for row in rows {
@@ -339,7 +498,6 @@ impl Database {
             rows = kept;
         }
 
-        // Order by
         if let Some(ob) = &order_by {
             let idx = schema
                 .column_index(&ob.column)
@@ -354,7 +512,6 @@ impl Database {
             });
         }
 
-        // Offset / Limit
         if let Some(off) = offset {
             let off = off as usize;
             rows = if off >= rows.len() {
@@ -367,13 +524,12 @@ impl Database {
             rows.truncate(lim as usize);
         }
 
-        // Projection
-        let indices: Vec<usize> = resolve_projection(&items, &schema)?;
-        let columns: Vec<String> = indices
+        let indices = resolve_projection(&items, &schema)?;
+        let columns = indices
             .iter()
             .map(|&i| schema.columns[i].name.clone())
             .collect();
-        let projected: Vec<Vec<Value>> = rows
+        let projected = rows
             .into_iter()
             .map(|row| indices.iter().map(|&i| row[i].clone()).collect())
             .collect();
@@ -388,11 +544,13 @@ impl Database {
 
     fn exec_update(
         &mut self,
+        txn: TxnId,
         table: String,
         assignments: Vec<(String, Expr)>,
         filter: Option<Expr>,
     ) -> Result<Output, EngineError> {
         let mut schema = self.schema_of(&table)?;
+        let snap = self.mgr.snapshot(txn).clone();
         let types = schema.types();
         if let Some(pk) = schema.pk_index() {
             if assignments
@@ -403,75 +561,97 @@ impl Database {
             }
         }
 
-        // gather (key, new_tuple) for matching rows, then apply
-        let mut updates: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        {
-            let mut tree = BPlusTree::open_at(&mut self.bp, schema.root);
-            for (key, bytes) in tree.scan(None, None)? {
-                let mut row = tuple::decode_tuple(&types, &bytes)?;
-                let keep = match &filter {
-                    Some(p) => matches!(eval::eval(p, &schema, &row)?, Value::Boolean(true)),
-                    None => true,
-                };
-                if !keep {
-                    continue;
-                }
-                for (cname, e) in &assignments {
-                    let idx = schema
-                        .column_index(cname)
-                        .ok_or_else(|| EngineError::UnknownColumn(cname.clone()))?;
-                    let v = eval::eval(e, &schema, &row)?;
-                    row[idx] = coerce(v, &schema.columns[idx])?;
-                }
-                updates.push((key, tuple::encode_tuple(&row)));
+        let mut ops: Vec<KeyedChain> = Vec::new();
+        for (key, chain) in self.table_scan(schema.root)? {
+            let Some(i) = mvcc::visible_index(&chain, &snap, &self.mgr) else {
+                continue;
+            };
+            let row = tuple::decode_tuple(&types, &chain[i].data)?;
+            let keep = match &filter {
+                Some(p) => matches!(eval::eval(p, &schema, &row)?, Value::Boolean(true)),
+                None => true,
+            };
+            if !keep {
+                continue;
             }
-        }
-        let count = updates.len();
-        {
-            let mut tree = BPlusTree::open_at(&mut self.bp, schema.root);
-            for (key, bytes) in updates {
-                tree.insert(&key, &bytes)?; // same key → overwrite
+            let v = &chain[i];
+            if v.xmax != txn && mvcc::is_live_delete(&self.mgr, v.xmax, v.xmax_committed) {
+                return Err(EngineError::Conflict(
+                    "row was updated by a concurrent transaction".into(),
+                ));
             }
-            schema.root = tree.root();
+            let mut newrow = row.clone();
+            for (cname, e) in &assignments {
+                let idx = schema
+                    .column_index(cname)
+                    .ok_or_else(|| EngineError::UnknownColumn(cname.clone()))?;
+                newrow[idx] = coerce(eval::eval(e, &schema, &row)?, &schema.columns[idx])?;
+            }
+            let mut newchain = chain.clone();
+            newchain[i].xmax = txn;
+            newchain.push(Version::new(txn, tuple::encode_tuple(&newrow)));
+            ops.push((key, newchain));
         }
-        catalog::put_table(&mut self.bp, &mut self.meta, &schema)?;
+
+        let count = ops.len();
+        for (key, chain) in ops {
+            self.table_put_chain(&mut schema, &key, &chain)?;
+            self.write_sets
+                .get_mut(&txn)
+                .expect("active txn")
+                .push((table.clone(), key));
+        }
         Ok(Output::Affected(count))
     }
 
-    fn exec_delete(&mut self, table: String, filter: Option<Expr>) -> Result<Output, EngineError> {
+    fn exec_delete(
+        &mut self,
+        txn: TxnId,
+        table: String,
+        filter: Option<Expr>,
+    ) -> Result<Output, EngineError> {
         let mut schema = self.schema_of(&table)?;
+        let snap = self.mgr.snapshot(txn).clone();
         let types = schema.types();
 
-        let mut keys: Vec<Vec<u8>> = Vec::new();
-        {
-            let mut tree = BPlusTree::open_at(&mut self.bp, schema.root);
-            for (key, bytes) in tree.scan(None, None)? {
-                let row = tuple::decode_tuple(&types, &bytes)?;
-                let del = match &filter {
-                    Some(p) => matches!(eval::eval(p, &schema, &row)?, Value::Boolean(true)),
-                    None => true,
-                };
-                if del {
-                    keys.push(key);
-                }
+        let mut ops: Vec<KeyedChain> = Vec::new();
+        for (key, chain) in self.table_scan(schema.root)? {
+            let Some(i) = mvcc::visible_index(&chain, &snap, &self.mgr) else {
+                continue;
+            };
+            let row = tuple::decode_tuple(&types, &chain[i].data)?;
+            let del = match &filter {
+                Some(p) => matches!(eval::eval(p, &schema, &row)?, Value::Boolean(true)),
+                None => true,
+            };
+            if !del {
+                continue;
             }
-        }
-        let count = keys.len();
-        {
-            let mut tree = BPlusTree::open_at(&mut self.bp, schema.root);
-            for key in keys {
-                tree.delete(&key)?;
+            let v = &chain[i];
+            if v.xmax != txn && mvcc::is_live_delete(&self.mgr, v.xmax, v.xmax_committed) {
+                return Err(EngineError::Conflict(
+                    "row was deleted by a concurrent transaction".into(),
+                ));
             }
-            schema.root = tree.root();
+            let mut newchain = chain.clone();
+            newchain[i].xmax = txn;
+            ops.push((key, newchain));
         }
-        catalog::put_table(&mut self.bp, &mut self.meta, &schema)?;
+
+        let count = ops.len();
+        for (key, chain) in ops {
+            self.table_put_chain(&mut schema, &key, &chain)?;
+            self.write_sets
+                .get_mut(&txn)
+                .expect("active txn")
+                .push((table.clone(), key));
+        }
         Ok(Output::Affected(count))
     }
 }
 
 // ---- helpers --------------------------------------------------------------
 
-/// An empty schema for evaluating column-free expressions (e.g. `VALUES`).
 fn empty_schema() -> TableSchema {
     TableSchema {
         name: String::new(),
@@ -547,7 +727,6 @@ fn coerce(v: Value, col: &ColumnInfo) -> Result<Value, EngineError> {
     }
 }
 
-/// Total order for `ORDER BY`; `NULL` sorts before all non-null values.
 fn value_cmp(a: &Value, b: &Value) -> Ordering {
     let num = |v: &Value| match v {
         Value::Integer(x) => Some(*x as f64),
@@ -569,14 +748,13 @@ fn value_cmp(a: &Value, b: &Value) -> Ordering {
 
 #[cfg(test)]
 mod crash_tests {
-    //! Deterministic crash simulations that drive the WAL recovery path directly,
-    //! rather than racing an OS `kill` (reliable in CI).
+    //! Deterministic crash simulations that drive WAL recovery directly.
     use super::*;
 
     fn tmp_path() -> std::path::PathBuf {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("crash.db");
-        std::mem::forget(dir); // keep the file alive for the whole test
+        std::mem::forget(dir);
         p
     }
 
@@ -601,17 +779,15 @@ mod crash_tests {
             db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
                 .unwrap();
             db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
-            // Crash *after* the WAL commit is durable but *before* data is flushed:
-            // log + commit to the WAL, then drop without force_data(). No-steal means
-            // the dirty buffer pages never reached disk, so only the WAL has the change.
-            let txn = db.next_txn;
-            db.next_txn += 1;
-            let stmt = sql::parse("INSERT INTO t VALUES (2, 20)").unwrap();
-            db.dispatch(stmt).unwrap();
+            // Freeze hints + WAL-commit, but crash before force_data().
+            let txn = db.begin();
+            db.execute_in(txn, "INSERT INTO t VALUES (2, 20)").unwrap();
+            db.finalize_hints(txn).unwrap();
+            db.mgr.commit(txn);
             db.wal_commit(txn).unwrap();
         }
         {
-            let mut db = Database::open(&path).unwrap(); // recovery replays the WAL
+            let mut db = Database::open(&path).unwrap();
             assert_eq!(select_vs(&mut db), vec![10, 20]);
         }
     }
@@ -624,13 +800,13 @@ mod crash_tests {
             db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
                 .unwrap();
             db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
-            // Mutate a statement but never write its commit to the WAL, then crash.
-            let stmt = sql::parse("INSERT INTO t VALUES (2, 20)").unwrap();
-            db.dispatch(stmt).unwrap();
+            let txn = db.begin();
+            db.execute_in(txn, "INSERT INTO t VALUES (2, 20)").unwrap();
+            // crash: drop without finalize/commit
         }
         {
             let mut db = Database::open(&path).unwrap();
-            assert_eq!(select_vs(&mut db), vec![10]); // row 2 is gone; row 1 intact
+            assert_eq!(select_vs(&mut db), vec![10]);
         }
     }
 }
