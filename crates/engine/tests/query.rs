@@ -235,6 +235,60 @@ fn index_seek_for_primary_key_equality() {
 }
 
 #[test]
+fn index_range_scan_for_primary_key_inequality() {
+    let mut db = fresh_db();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    let mut sql = String::from("INSERT INTO t VALUES ");
+    for i in 1..=20 {
+        if i > 1 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({i},{})", i * 10));
+    }
+    db.execute(&sql).unwrap();
+
+    // A two-sided range drives a bounded B+-tree scan: 5 <= id < 9.
+    let plan = explain_text(&mut db, "EXPLAIN SELECT id FROM t WHERE id >= 5 AND id < 9");
+    assert!(
+        plan.contains("IndexRange t (5 <= pk < 9)"),
+        "plan was:\n{plan}"
+    );
+    let got = rows(
+        db.execute("SELECT id FROM t WHERE id >= 5 AND id < 9")
+            .unwrap(),
+    );
+    assert_eq!(
+        got,
+        vec![vec![int(5)], vec![int(6)], vec![int(7)], vec![int(8)]]
+    );
+
+    // `>` widens to an inclusive index lower bound, but the residual filter
+    // still excludes the boundary value — exact semantics are preserved.
+    let plan = explain_text(&mut db, "EXPLAIN SELECT id FROM t WHERE id > 18");
+    assert!(
+        plan.contains("IndexRange t (pk >= 18)"),
+        "plan was:\n{plan}"
+    );
+    assert!(plan.contains("filter: id > 18"), "plan was:\n{plan}");
+    let got = rows(db.execute("SELECT id FROM t WHERE id > 18").unwrap());
+    assert_eq!(got, vec![vec![int(19)], vec![int(20)]]);
+
+    // `<` maps to an exact exclusive upper bound.
+    let plan = explain_text(&mut db, "EXPLAIN SELECT id FROM t WHERE id < 4");
+    assert!(plan.contains("IndexRange t (pk < 4)"), "plan was:\n{plan}");
+    let got = rows(db.execute("SELECT id FROM t WHERE id < 4").unwrap());
+    assert_eq!(got, vec![vec![int(1)], vec![int(2)], vec![int(3)]]);
+
+    // `<=` has no exclusive-upper key, so it falls back to a sequential scan
+    // (still correct via the filter) — a documented limitation.
+    let plan = explain_text(&mut db, "EXPLAIN SELECT id FROM t WHERE id <= 3");
+    assert!(plan.contains("SeqScan t"), "plan was:\n{plan}");
+    let got = rows(db.execute("SELECT id FROM t WHERE id <= 3").unwrap());
+    assert_eq!(got, vec![vec![int(1)], vec![int(2)], vec![int(3)]]);
+}
+
+#[test]
 fn single_table_predicate_is_pushed_to_the_scan() {
     let mut db = users_and_orders();
     let plan = explain_text(

@@ -429,6 +429,11 @@ pub enum Access {
     Seq,
     /// B+-tree seek on the primary key: `pk <op> key`.
     IndexSeek { op: BinOp, key: Expr },
+    /// B+-tree range scan on the primary key. `lo` is an inclusive lower bound
+    /// and `hi` an exclusive upper bound (either may be absent). The scan's
+    /// residual `filter` still applies, so these bounds only prune the range —
+    /// the exact predicate semantics come from the filter.
+    IndexRange { lo: Option<Expr>, hi: Option<Expr> },
 }
 
 #[derive(Clone, Debug)]
@@ -520,6 +525,17 @@ impl Plan {
                     Access::Seq => format!("SeqScan {named}"),
                     Access::IndexSeek { op, key } => {
                         format!("IndexSeek {named} (pk {} {})", fmt_op(*op), fmt_expr(key))
+                    }
+                    Access::IndexRange { lo, hi } => {
+                        let bound = match (lo, hi) {
+                            (Some(l), Some(h)) => {
+                                format!("{} <= pk < {}", fmt_expr(l), fmt_expr(h))
+                            }
+                            (Some(l), None) => format!("pk >= {}", fmt_expr(l)),
+                            (None, Some(h)) => format!("pk < {}", fmt_expr(h)),
+                            (None, None) => "all".to_string(),
+                        };
+                        format!("IndexRange {named} ({bound})")
                     }
                 };
                 let filt = filter

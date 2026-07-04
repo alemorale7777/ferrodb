@@ -26,6 +26,11 @@ pub struct TableSchema {
     pub columns: Vec<ColumnInfo>,
     pub root: PageId,
     pub next_rowid: u64,
+    /// Approximate count of live rows, maintained incrementally on
+    /// INSERT/DELETE. The optimizer reads this as a cardinality statistic so
+    /// planning never has to scan the table (cf. PostgreSQL's `reltuples`).
+    /// It is a heuristic — snapshot-independent and not exact under concurrency.
+    pub row_count: u64,
 }
 
 impl TableSchema {
@@ -71,6 +76,7 @@ fn encode_schema(s: &TableSchema) -> Vec<u8> {
     }
     out.extend_from_slice(&s.root.0.to_le_bytes());
     out.extend_from_slice(&s.next_rowid.to_le_bytes());
+    out.extend_from_slice(&s.row_count.to_le_bytes());
     out
 }
 
@@ -118,11 +124,18 @@ fn decode_schema(name: &str, bytes: &[u8]) -> Result<TableSchema, EngineError> {
             .try_into()
             .unwrap(),
     );
+    pos += 8;
+    // row_count was added later; tolerate catalogs written before it existed.
+    let row_count = match bytes.get(pos..pos + 8) {
+        Some(b) => u64::from_le_bytes(b.try_into().unwrap()),
+        None => 0,
+    };
     Ok(TableSchema {
         name: name.to_string(),
         columns,
         root,
         next_rowid,
+        row_count,
     })
 }
 

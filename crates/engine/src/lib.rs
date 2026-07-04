@@ -419,6 +419,7 @@ impl Database {
             columns: cols,
             root: data_root,
             next_rowid: 1,
+            row_count: 0,
         };
         catalog::put_table(&mut self.bp, &mut self.meta, &schema)?;
         Ok(Output::Ack("CREATE TABLE"))
@@ -501,6 +502,9 @@ impl Database {
                 return Err(EngineError::Constraint("duplicate primary key".into()));
             }
             chain.push(Version::new(txn, tuple::encode_tuple(&row)));
+            // Update the cardinality statistic before persisting so the write
+            // through table_put_chain carries the new count into the catalog.
+            schema.row_count += 1;
             self.table_put_chain(&mut schema, &key, &chain)?;
             self.write_sets
                 .get_mut(&txn)
@@ -515,7 +519,7 @@ impl Database {
 
     fn exec_select(&mut self, txn: TxnId, sel: Select) -> Result<Output, EngineError> {
         let snap = self.mgr.snapshot(txn).clone();
-        let plan = self.build_plan(&sel, &snap)?;
+        let plan = self.build_plan(&sel)?;
         let rs = self.run_plan(&plan, &snap)?;
         Ok(Output::Rows {
             columns: rs.schema.iter().map(|c| c.name.clone()).collect(),
@@ -524,8 +528,8 @@ impl Database {
     }
 
     fn exec_explain(&mut self, txn: TxnId, sel: Select) -> Result<Output, EngineError> {
-        let snap = self.mgr.snapshot(txn).clone();
-        let plan = self.build_plan(&sel, &snap)?;
+        let _ = txn;
+        let plan = self.build_plan(&sel)?;
         let rows = plan
             .explain()
             .into_iter()
@@ -538,7 +542,7 @@ impl Database {
     }
 
     /// A base relation participating in a query: its alias, schema and estimated size.
-    fn gather_rels(&mut self, sel: &Select, snap: &Snapshot) -> Result<Vec<Rel>, EngineError> {
+    fn gather_rels(&mut self, sel: &Select) -> Result<Vec<Rel>, EngineError> {
         let mut refs: Vec<&TableRef> = vec![&sel.from];
         refs.extend(sel.joins.iter().map(|j| &j.right));
         let mut rels = Vec::with_capacity(refs.len());
@@ -553,7 +557,8 @@ impl Database {
                     "duplicate table name '{alias}'"
                 )));
             }
-            let est = self.count_visible(&schema, snap)? as f64;
+            // Read the cardinality statistic straight from the catalog — no scan.
+            let est = schema.row_count as f64;
             rels.push(Rel {
                 alias,
                 table: r.name.clone(),
@@ -572,8 +577,8 @@ impl Database {
     /// left-deep join tree to minimise estimated intermediate cardinality.
     /// Queries with a `LEFT` join fall back to a written-order left-deep plan
     /// (reordering an outer join is not generally valid).
-    fn build_plan(&mut self, sel: &Select, snap: &Snapshot) -> Result<Plan, EngineError> {
-        let rels = self.gather_rels(sel, snap)?;
+    fn build_plan(&mut self, sel: &Select) -> Result<Plan, EngineError> {
+        let rels = self.gather_rels(sel)?;
         let scope = scope_columns(&rels);
 
         let all_inner = sel.joins.iter().all(|j| j.join_type == JoinType::Inner);
@@ -801,22 +806,35 @@ impl Database {
                     }
                 }
             }
-        }
-        Ok(RowSet { schema: cols, rows })
-    }
-
-    fn count_visible(
-        &mut self,
-        schema: &TableSchema,
-        snap: &Snapshot,
-    ) -> Result<usize, EngineError> {
-        let mut n = 0;
-        for (_k, chain) in self.table_scan(schema.root)? {
-            if mvcc::visible_index(&chain, snap, &self.mgr).is_some() {
-                n += 1;
+            Access::IndexRange { lo, hi } => {
+                // Encode the bounds (order-preserving PK keys) and let the
+                // B+-tree seek straight to the starting leaf and walk the sibling
+                // chain — `lo` inclusive, `hi` exclusive.
+                let bound = |e: &Option<Expr>| -> Result<Option<Vec<u8>>, EngineError> {
+                    match e {
+                        Some(e) => Ok(Some(tuple::value_to_key(&eval::eval(
+                            e,
+                            &empty_schema(),
+                            &[],
+                        )?)?)),
+                        None => Ok(None),
+                    }
+                };
+                let lo_b = bound(lo)?;
+                let hi_b = bound(hi)?;
+                let raw = {
+                    let mut tree = BPlusTree::open_at(&mut self.bp, schema.root);
+                    tree.scan(lo_b.as_deref(), hi_b.as_deref())?
+                };
+                for (_k, bytes) in raw {
+                    let chain = mvcc::decode_chain(&bytes);
+                    if let Some(i) = mvcc::visible_index(&chain, snap, &self.mgr) {
+                        rows.push(tuple::decode_tuple(&types, &chain[i].data)?);
+                    }
+                }
             }
         }
-        Ok(n)
+        Ok(RowSet { schema: cols, rows })
     }
 
     // ---- UPDATE / DELETE --------------------------------------------------
@@ -918,6 +936,9 @@ impl Database {
         }
 
         let count = ops.len();
+        // Decrement the cardinality statistic before persisting the tombstoned
+        // chains, so each table_put_chain carries the new count into the catalog.
+        schema.row_count = schema.row_count.saturating_sub(count as u64);
         for (key, chain) in ops {
             self.table_put_chain(&mut schema, &key, &chain)?;
             self.write_sets
@@ -937,6 +958,7 @@ fn empty_schema() -> TableSchema {
         columns: Vec::new(),
         root: PageId(0),
         next_rowid: 0,
+        row_count: 0,
     }
 }
 
@@ -1094,8 +1116,58 @@ fn pk_seek_key(conj: &Expr, rel: &Rel) -> Option<Expr> {
     None
 }
 
-/// Build a base-relation scan, choosing a PK index seek when possible and
-/// attaching any remaining single-relation predicates as a pushed-down filter.
+/// Which side of a range a sargable PK inequality contributes.
+enum PkBound {
+    /// Inclusive lower bound, usable directly as the B+-tree scan's `lo`.
+    Lower(Expr),
+    /// Exclusive upper bound, usable directly as the B+-tree scan's `hi`.
+    Upper(Expr),
+}
+
+/// Flip a comparison operator to normalise `const <op> pk` into `pk <op> const`.
+fn flip_op(op: BinOp) -> BinOp {
+    match op {
+        BinOp::Lt => BinOp::Gt,
+        BinOp::Le => BinOp::Ge,
+        BinOp::Gt => BinOp::Lt,
+        BinOp::Ge => BinOp::Le,
+        other => other,
+    }
+}
+
+/// If `conj` is a sargable PK inequality on `rel`, return the range bound it
+/// implies. Bounds are conservative supersets — the scan's residual filter
+/// still enforces exact semantics — so `>` widens to an inclusive lower bound
+/// and `<=` yields no index bound at all (it would need the key's successor).
+fn pk_range_bound(conj: &Expr, rel: &Rel) -> Option<PkBound> {
+    let pk = rel.schema.pk_index()?;
+    let pk_name = &rel.schema.columns[pk].name;
+    let is_pk = |e: &Expr| {
+        matches!(e, Expr::Column { table, name }
+            if name.eq_ignore_ascii_case(pk_name)
+            && table.as_deref().is_none_or(|t| t.eq_ignore_ascii_case(&rel.alias)))
+    };
+    let Expr::Binary { op, left, right } = conj else {
+        return None;
+    };
+    let (op, konst) = if is_pk(left) && is_const(right) {
+        (*op, (**right).clone())
+    } else if is_pk(right) && is_const(left) {
+        (flip_op(*op), (**left).clone())
+    } else {
+        return None;
+    };
+    match op {
+        BinOp::Ge | BinOp::Gt => Some(PkBound::Lower(konst)),
+        BinOp::Lt => Some(PkBound::Upper(konst)),
+        _ => None,
+    }
+}
+
+/// Build a base-relation scan, choosing the cheapest available PK access path —
+/// an equality index seek, else a B+-tree range scan for PK inequalities, else
+/// a sequential scan — and attaching the single-relation predicates as a
+/// pushed-down filter. Range predicates stay in the filter for exact semantics.
 fn scan_with_pushdown(rel: &Rel, pushed: &[Expr]) -> (Plan, f64) {
     let mut remaining: Vec<Expr> = pushed.to_vec();
     let mut est = rel.est;
@@ -1108,11 +1180,25 @@ fn scan_with_pushdown(rel: &Rel, pushed: &[Expr]) -> (Plan, f64) {
         est = 1.0;
         Access::IndexSeek { op: BinOp::Eq, key }
     } else {
+        // No equality seek: look for PK range bounds to drive a range scan.
+        let mut lo = None;
+        let mut hi = None;
+        for c in &remaining {
+            match pk_range_bound(c, rel) {
+                Some(PkBound::Lower(k)) if lo.is_none() => lo = Some(k),
+                Some(PkBound::Upper(k)) if hi.is_none() => hi = Some(k),
+                _ => {}
+            }
+        }
         for c in &remaining {
             est *= selectivity(c);
         }
         est = est.max(1.0);
-        Access::Seq
+        if lo.is_some() || hi.is_some() {
+            Access::IndexRange { lo, hi }
+        } else {
+            Access::Seq
+        }
     };
     let plan = Plan::Scan {
         table: rel.table.clone(),
