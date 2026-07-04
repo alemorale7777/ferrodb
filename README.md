@@ -5,9 +5,20 @@ indexes, write-ahead logging with crash recovery, MVCC transactions, a cost-base
 planner, and the PostgreSQL wire protocol. No third-party SQL parser, storage engine, or
 B+-tree crate: the point is to build the machine, not glue one together.
 
-> **Status:** Milestones 1–3 complete and green — it runs real SQL, persisted to
-> disk, and survives a crash. See the
+> **Status:** Milestones 1–4 complete and green — it runs real SQL, persisted to
+> disk, survives a crash, and gives concurrent transactions snapshot isolation. See the
 > [full design & roadmap](docs/superpowers/specs/2026-07-02-ferrodb-design.md).
+
+## Milestone 4 — MVCC transactions ✅
+
+`BEGIN` / `COMMIT` / `ROLLBACK` with **snapshot isolation**. Each row is a **version chain**:
+`INSERT` appends a version, `UPDATE` is delete-old + append-new, `DELETE` stamps a tombstone —
+nothing is overwritten in place. A transaction captures a snapshot at `BEGIN` and sees a
+consistent view; **readers never block writers**. Two transactions writing the same row is a
+first-updater-wins **write conflict**. Per-version commit **hint bits** are the persisted source
+of truth, so a committed version is visible after restart with no separate commit log; a
+crashed/rolled-back transaction is simply invisible — no undo pass. `VACUUM` reclaims versions
+dead to every live snapshot. Proven by interleaved-transaction tests (`crates/engine/tests/mvcc.rs`).
 
 ## Milestone 3 — WAL + crash recovery ✅
 
@@ -98,7 +109,7 @@ Built bottom-up; each milestone is an independently testable, demoable artifact.
 | **M1** | **Storage engine** ✅ | pager · buffer pool · B+-tree · overflow · durability |
 | **M2** | **SQL frontend + executor** ✅ | lexer → Pratt parser → binder → volcano executor |
 | **M3** | **WAL + crash recovery** ✅ | no-steal redo log; crash mid-write, restart, data intact |
-| M4 | MVCC transactions | snapshot isolation · `BEGIN`/`COMMIT`/`ROLLBACK` · `VACUUM` |
+| **M4** | **MVCC transactions** ✅ | version chains; snapshot isolation · `BEGIN`/`COMMIT`/`ROLLBACK` · write conflicts · `VACUUM` |
 | M5 | Cost-based optimizer | statistics · join ordering · index selection · `EXPLAIN` |
 | M6 | PostgreSQL wire protocol | connect with real `psql` |
 | M7 | WASM web playground | in-browser engine + live B+-tree visualizer |
