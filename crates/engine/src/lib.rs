@@ -92,7 +92,16 @@ impl Database {
         let mut dm = DiskManager::open(data_path)?;
         let mut wal = Wal::open(&wal_path)?;
         wal.recover(&mut dm)?;
+        Database::from_parts(dm, wal)
+    }
 
+    /// Open a database backed entirely by memory — no filesystem, no persistence.
+    /// This is what lets the engine run in the browser (WebAssembly).
+    pub fn open_in_memory() -> Result<Database, EngineError> {
+        Database::from_parts(DiskManager::in_memory(), Wal::in_memory())
+    }
+
+    fn from_parts(dm: DiskManager, wal: Wal) -> Result<Database, EngineError> {
         let mut bp = BufferPool::new(dm, 256);
         bp.set_no_steal(true);
         let meta = load_meta(&mut bp)?;

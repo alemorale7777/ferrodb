@@ -8,10 +8,11 @@
 //! so recovery is **redo-only**: replay the after-images of committed txns.
 
 use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use crate::blob::{Blob, MemBlob};
 use crate::disk::DiskManager;
 use crate::page::{Page, PageId, PAGE_SIZE};
 use crate::Result;
@@ -23,7 +24,7 @@ const UPDATE_LEN: usize = 1 + 8 + 4 + PAGE_SIZE;
 const COMMIT_LEN: usize = 1 + 8;
 
 pub struct Wal {
-    file: File,
+    blob: Box<dyn Blob>,
 }
 
 impl Wal {
@@ -34,47 +35,56 @@ impl Wal {
             .create(true)
             .truncate(false)
             .open(path)?;
-        Ok(Wal { file })
+        Ok(Wal {
+            blob: Box::new(file),
+        })
+    }
+
+    /// A WAL backed entirely by memory (no filesystem — for WebAssembly).
+    pub fn in_memory() -> Wal {
+        Wal {
+            blob: Box::new(MemBlob::new()),
+        }
     }
 
     /// Append a full-page after-image for `pid` under transaction `txn`.
     pub fn append_update(&mut self, txn: u64, pid: PageId, page: &Page) -> Result<()> {
-        self.file.seek(SeekFrom::End(0))?;
-        self.file.write_all(&[REC_UPDATE])?;
-        self.file.write_all(&txn.to_le_bytes())?;
-        self.file.write_all(&pid.0.to_le_bytes())?;
-        self.file.write_all(page.as_bytes())?;
+        self.blob.seek(SeekFrom::End(0))?;
+        self.blob.write_all(&[REC_UPDATE])?;
+        self.blob.write_all(&txn.to_le_bytes())?;
+        self.blob.write_all(&pid.0.to_le_bytes())?;
+        self.blob.write_all(page.as_bytes())?;
         Ok(())
     }
 
     /// Append a commit marker for `txn`.
     pub fn append_commit(&mut self, txn: u64) -> Result<()> {
-        self.file.seek(SeekFrom::End(0))?;
-        self.file.write_all(&[REC_COMMIT])?;
-        self.file.write_all(&txn.to_le_bytes())?;
+        self.blob.seek(SeekFrom::End(0))?;
+        self.blob.write_all(&[REC_COMMIT])?;
+        self.blob.write_all(&txn.to_le_bytes())?;
         Ok(())
     }
 
     /// Force the log to durable storage. Call before flushing data pages.
     pub fn sync(&mut self) -> Result<()> {
-        self.file.sync_all()?;
+        self.blob.sync()?;
         Ok(())
     }
 
     /// Truncate the log to empty (its records are now durable in the data file).
     pub fn reset(&mut self) -> Result<()> {
-        self.file.set_len(0)?;
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.sync_all()?;
+        self.blob.set_len(0)?;
+        self.blob.seek(SeekFrom::Start(0))?;
+        self.blob.sync()?;
         Ok(())
     }
 
     /// Replay committed page images into the data file, then clear the log.
     /// A truncated tail record (the crash point) ends parsing.
     pub fn recover(&mut self, dm: &mut DiskManager) -> Result<()> {
-        self.file.seek(SeekFrom::Start(0))?;
+        self.blob.seek(SeekFrom::Start(0))?;
         let mut buf = Vec::new();
-        self.file.read_to_end(&mut buf)?;
+        self.blob.read_to_end(&mut buf)?;
 
         let mut updates: Vec<(u64, PageId, [u8; PAGE_SIZE])> = Vec::new();
         let mut committed: HashSet<u64> = HashSet::new();

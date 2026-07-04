@@ -43,6 +43,21 @@ fn users_and_orders() -> Database {
 }
 
 #[test]
+fn in_memory_database_runs_the_full_stack() {
+    // No filesystem — the same path the WASM build uses.
+    let mut db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+    db.execute("UPDATE t SET v = v + 1 WHERE id = 2").unwrap();
+    let out = db
+        .execute("SELECT SUM(v) AS s FROM t WHERE id >= 2")
+        .unwrap();
+    assert_eq!(rows(out), vec![vec![int(51)]]); // 21 + 30
+}
+
+#[test]
 fn inner_join_matches_rows() {
     let mut db = users_and_orders();
     let out = db
