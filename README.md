@@ -5,10 +5,31 @@ indexes, write-ahead logging with crash recovery, MVCC transactions, a cost-base
 planner, and the PostgreSQL wire protocol. No third-party SQL parser, storage engine, or
 B+-tree crate: the point is to build the machine, not glue one together.
 
-> **Status:** Milestones 1–5 complete and green — it runs real SQL with joins and
+> **Status:** Milestones 1–6 complete and green — it runs real SQL with joins and
 > grouped aggregation, persisted to disk, survives a crash, gives concurrent transactions
-> snapshot isolation, and plans queries with a cost-based optimizer. See the
+> snapshot isolation, plans queries with a cost-based optimizer, and speaks the
+> **PostgreSQL wire protocol** so `psql` can connect. See the
 > [full design & roadmap](docs/superpowers/specs/2026-07-02-ferrodb-design.md).
+
+## Milestone 6 — PostgreSQL wire protocol ✅
+
+ferrodb speaks enough of the **PostgreSQL v3 protocol** that the real `psql` client — or any
+Postgres driver — can connect over TCP and run SQL:
+
+```console
+$ cargo run -p pgwire --bin ferrodb-pg -- mydata.db --port 5432
+ferrodb-pg listening on 127.0.0.1:5432 (database: mydata.db)
+
+$ psql -h 127.0.0.1 -p 5432
+ferrodb=> SELECT u.name, SUM(o.total) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.name;
+```
+
+The startup handshake (including the SSL-request rejection every client sends first), the simple
+query cycle (`RowDescription` / `DataRow` / `CommandComplete`), transaction control
+(`BEGIN`/`COMMIT`/`ROLLBACK` mapped to the engine's MVCC transactions), and `ErrorResponse` are all
+implemented — **by hand, no async runtime and no protocol crate**. A shared `Arc<Mutex<Database>>`
+serves each connection on its own thread. The v3 byte framing is validated by in-process wire tests
+(`crates/pgwire/tests/wire.rs`) that drive the protocol over a loopback socket.
 
 ## Milestone 5 — Joins, aggregates & a cost-based optimizer ✅
 
@@ -138,7 +159,7 @@ Built bottom-up; each milestone is an independently testable, demoable artifact.
 | **M3** | **WAL + crash recovery** ✅ | no-steal redo log; crash mid-write, restart, data intact |
 | **M4** | **MVCC transactions** ✅ | version chains; snapshot isolation · `BEGIN`/`COMMIT`/`ROLLBACK` · write conflicts · `VACUUM` |
 | **M5** | **Joins, aggregates & cost-based optimizer** ✅ | hash/nested-loop joins · `GROUP BY`/`HAVING` · predicate pushdown · PK index seeks · join ordering · `EXPLAIN` |
-| M6 | PostgreSQL wire protocol | connect with real `psql` |
+| **M6** | **PostgreSQL wire protocol** ✅ | connect with real `psql`; simple query · transactions · hand-rolled v3 framing |
 | M7 | WASM web playground | in-browser engine + live B+-tree visualizer |
 | M8 | Benchmarks + docs | SQLite comparison · mdBook architecture book |
 
@@ -148,6 +169,7 @@ Built bottom-up; each milestone is an independently testable, demoable artifact.
 crates/storage   disk · buffer pool · slotted pages · B+-tree · WAL + recovery
 crates/sql       lexer · Pratt parser · AST
 crates/engine    catalog · tuple codec · evaluator · MVCC · planner + optimizer · executor
+crates/pgwire    PostgreSQL wire protocol server (ferrodb-pg)
 crates/cli       ferrodb-kv (raw KV) + ferrodb (SQL shell)
 docs/            design spec + implementation plans
 ```
