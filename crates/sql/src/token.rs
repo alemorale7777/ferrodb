@@ -44,6 +44,10 @@ pub enum Keyword {
     Group,
     Having,
     Explain,
+    Vector,
+    Index,
+    Using,
+    Hnsw,
 }
 
 fn keyword_from(word: &str) -> Option<Keyword> {
@@ -89,6 +93,10 @@ fn keyword_from(word: &str) -> Option<Keyword> {
         "GROUP" => Group,
         "HAVING" => Having,
         "EXPLAIN" => Explain,
+        "VECTOR" => Vector,
+        "INDEX" => Index,
+        "USING" => Using,
+        "HNSW" => Hnsw,
         _ => return None,
     })
 }

@@ -113,12 +113,28 @@ impl Parser {
             Token::Keyword(Keyword::Real) => Ok(DataType::Real),
             Token::Keyword(Keyword::Text) => Ok(DataType::Text),
             Token::Keyword(Keyword::Boolean) => Ok(DataType::Boolean),
+            Token::Keyword(Keyword::Vector) => {
+                self.eat(&Token::LParen)?;
+                let dim = match self.next() {
+                    Token::Int(n) if (1..=u16::MAX as i64).contains(&n) => n as u16,
+                    other => {
+                        return Err(SqlError::Parse(format!(
+                            "VECTOR dimension must be 1..=65535, found {other:?}"
+                        )))
+                    }
+                };
+                self.eat(&Token::RParen)?;
+                Ok(DataType::Vector(dim))
+            }
             other => Err(SqlError::Parse(format!("expected a type, found {other:?}"))),
         }
     }
 
     fn parse_create(&mut self) -> PResult<Statement> {
         self.eat_kw(Keyword::Create)?;
+        if self.is_kw(Keyword::Index) {
+            return self.parse_create_index();
+        }
         self.eat_kw(Keyword::Table)?;
         let name = self.ident()?;
         self.eat(&Token::LParen)?;
@@ -156,6 +172,26 @@ impl Parser {
         }
         self.eat(&Token::RParen)?;
         Ok(Statement::CreateTable { name, columns })
+    }
+
+    /// `CREATE INDEX <name> ON <table> USING HNSW (<column>)` — mirrors
+    /// pgvector's `CREATE INDEX ... USING hnsw (col vector_l2_ops)` shape,
+    /// minus the opclass (M9 indexes are L2; operators land with M9-stretch).
+    fn parse_create_index(&mut self) -> PResult<Statement> {
+        self.eat_kw(Keyword::Index)?;
+        let name = self.ident()?;
+        self.eat_kw(Keyword::On)?;
+        let table = self.ident()?;
+        self.eat_kw(Keyword::Using)?;
+        self.eat_kw(Keyword::Hnsw)?;
+        self.eat(&Token::LParen)?;
+        let column = self.ident()?;
+        self.eat(&Token::RParen)?;
+        Ok(Statement::CreateIndex {
+            name,
+            table,
+            column,
+        })
     }
 
     fn parse_drop(&mut self) -> PResult<Statement> {
@@ -495,6 +531,17 @@ impl Parser {
             Token::Keyword(Keyword::Null) => Ok(Expr::Literal(Value::Null)),
             Token::Ident(name) => {
                 if self.peek() == &Token::LParen {
+                    if name.eq_ignore_ascii_case("distance") {
+                        self.next(); // (
+                        let left = self.parse_expr(0)?;
+                        self.eat(&Token::Comma)?;
+                        let right = self.parse_expr(0)?;
+                        self.eat(&Token::RParen)?;
+                        return Ok(Expr::Distance {
+                            left: Box::new(left),
+                            right: Box::new(right),
+                        });
+                    }
                     let Some(func) = agg_from(&name) else {
                         return Err(SqlError::Parse(format!("unknown function '{name}'")));
                     };

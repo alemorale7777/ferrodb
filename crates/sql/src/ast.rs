@@ -7,6 +7,9 @@ pub enum DataType {
     Real,
     Text,
     Boolean,
+    /// A fixed-dimension `f32` vector column (M9), e.g. `VECTOR(768)`.
+    /// The dimension is part of the type: inserts are validated against it.
+    Vector(u16),
 }
 
 /// A runtime SQL value, including the three-valued `NULL`.
@@ -17,6 +20,9 @@ pub enum Value {
     Real(f64),
     Text(String),
     Boolean(bool),
+    /// A vector literal/runtime value. Written in SQL as a pgvector-style
+    /// quoted literal `'[0.1, 0.2, ...]'` coerced by the engine.
+    Vector(Vec<f32>),
 }
 
 /// Binary operators, in the grammar's precedence tiers.
@@ -79,6 +85,13 @@ pub enum Expr {
     Aggregate {
         func: AggFunc,
         arg: Option<Box<Expr>>,
+    },
+    /// `distance(a, b)` — squared L2 distance between two vectors (M9).
+    /// The planner turns `ORDER BY distance(col, '[..]') LIMIT k` into an
+    /// HNSW index scan when one exists; otherwise it evaluates exactly.
+    Distance {
+        left: Box<Expr>,
+        right: Box<Expr>,
     },
 }
 
@@ -186,6 +199,12 @@ pub enum Statement {
     Delete {
         table: String,
         filter: Option<Expr>,
+    },
+    /// `CREATE INDEX <name> ON <table> USING HNSW (<column>)` (M9).
+    CreateIndex {
+        name: String,
+        table: String,
+        column: String,
     },
     /// `EXPLAIN <select>` — return the physical plan instead of running it.
     Explain(Box<Statement>),

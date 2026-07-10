@@ -20,6 +20,15 @@ pub struct ColumnInfo {
     pub primary_key: bool,
 }
 
+/// A registered secondary index (M9: HNSW over one vector column).
+#[derive(Clone, Debug, PartialEq)]
+pub struct IndexInfo {
+    pub name: String,
+    pub column: String,
+    pub m: u32,
+    pub ef_construction: u32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TableSchema {
     pub name: String,
@@ -31,6 +40,10 @@ pub struct TableSchema {
     /// planning never has to scan the table (cf. PostgreSQL's `reltuples`).
     /// It is a heuristic — snapshot-independent and not exact under concurrency.
     pub row_count: u64,
+    /// Secondary indexes (M9). Encoded after `row_count`; catalogs written
+    /// before M9 decode with an empty list — the same tolerate-missing-tail
+    /// pattern `row_count` itself used.
+    pub indexes: Vec<IndexInfo>,
 }
 
 impl TableSchema {
@@ -47,21 +60,35 @@ impl TableSchema {
     }
 }
 
-fn type_tag(t: DataType) -> u8 {
+/// Encode a column type: one tag byte, plus a u16 dimension for vectors
+/// (the only variable-width type — the dimension is part of the type).
+fn encode_type(t: DataType, out: &mut Vec<u8>) {
     match t {
-        DataType::Integer => 0,
-        DataType::Real => 1,
-        DataType::Text => 2,
-        DataType::Boolean => 3,
+        DataType::Integer => out.push(0),
+        DataType::Real => out.push(1),
+        DataType::Text => out.push(2),
+        DataType::Boolean => out.push(3),
+        DataType::Vector(dim) => {
+            out.push(4);
+            out.extend_from_slice(&dim.to_le_bytes());
+        }
     }
 }
-fn tag_type(b: u8) -> Result<DataType, EngineError> {
-    Ok(match b {
+fn decode_type(bytes: &[u8], pos: &mut usize) -> Result<DataType, EngineError> {
+    let corrupt = || EngineError::Type("corrupt catalog type tag".into());
+    let tag = *bytes.get(*pos).ok_or_else(corrupt)?;
+    *pos += 1;
+    Ok(match tag {
         0 => DataType::Integer,
         1 => DataType::Real,
         2 => DataType::Text,
         3 => DataType::Boolean,
-        _ => return Err(EngineError::Type("corrupt catalog type tag".into())),
+        4 => {
+            let d = bytes.get(*pos..*pos + 2).ok_or_else(corrupt)?;
+            *pos += 2;
+            DataType::Vector(u16::from_le_bytes(d.try_into().unwrap()))
+        }
+        _ => return Err(corrupt()),
     })
 }
 
@@ -71,12 +98,22 @@ fn encode_schema(s: &TableSchema) -> Vec<u8> {
     for c in &s.columns {
         out.extend_from_slice(&(c.name.len() as u16).to_le_bytes());
         out.extend_from_slice(c.name.as_bytes());
-        out.push(type_tag(c.data_type));
+        encode_type(c.data_type, &mut out);
         out.push((c.not_null as u8) | ((c.primary_key as u8) << 1));
     }
     out.extend_from_slice(&s.root.0.to_le_bytes());
     out.extend_from_slice(&s.next_rowid.to_le_bytes());
     out.extend_from_slice(&s.row_count.to_le_bytes());
+    // M9: secondary indexes, after everything older decoders read.
+    out.extend_from_slice(&(s.indexes.len() as u16).to_le_bytes());
+    for ix in &s.indexes {
+        for text in [&ix.name, &ix.column] {
+            out.extend_from_slice(&(text.len() as u16).to_le_bytes());
+            out.extend_from_slice(text.as_bytes());
+        }
+        out.extend_from_slice(&ix.m.to_le_bytes());
+        out.extend_from_slice(&ix.ef_construction.to_le_bytes());
+    }
     out
 }
 
@@ -98,8 +135,7 @@ fn decode_schema(name: &str, bytes: &[u8]) -> Result<TableSchema, EngineError> {
         let name_b = bytes.get(pos..pos + nlen).ok_or_else(corrupt)?;
         let col_name = String::from_utf8(name_b.to_vec()).map_err(|_| corrupt())?;
         pos += nlen;
-        let ty = tag_type(*bytes.get(pos).ok_or_else(corrupt)?)?;
-        pos += 1;
+        let ty = decode_type(bytes, &mut pos)?;
         let flags = *bytes.get(pos).ok_or_else(corrupt)?;
         pos += 1;
         columns.push(ColumnInfo {
@@ -127,15 +163,47 @@ fn decode_schema(name: &str, bytes: &[u8]) -> Result<TableSchema, EngineError> {
     pos += 8;
     // row_count was added later; tolerate catalogs written before it existed.
     let row_count = match bytes.get(pos..pos + 8) {
-        Some(b) => u64::from_le_bytes(b.try_into().unwrap()),
+        Some(b) => {
+            pos += 8;
+            u64::from_le_bytes(b.try_into().unwrap())
+        }
         None => 0,
     };
+    // Indexes (M9) were added later still; same tolerance.
+    let mut indexes = Vec::new();
+    if let Some(b) = bytes.get(pos..pos + 2) {
+        let n = u16::from_le_bytes(b.try_into().unwrap()) as usize;
+        pos += 2;
+        for _ in 0..n {
+            let text = |pos: &mut usize| -> Result<String, EngineError> {
+                let lb = bytes.get(*pos..*pos + 2).ok_or_else(corrupt)?;
+                let len = u16::from_le_bytes(lb.try_into().unwrap()) as usize;
+                *pos += 2;
+                let sb = bytes.get(*pos..*pos + len).ok_or_else(corrupt)?;
+                *pos += len;
+                String::from_utf8(sb.to_vec()).map_err(|_| corrupt())
+            };
+            let iname = text(&mut pos)?;
+            let column = text(&mut pos)?;
+            let mb = bytes.get(pos..pos + 8).ok_or_else(corrupt)?;
+            let m = u32::from_le_bytes(mb[0..4].try_into().unwrap());
+            let ef_construction = u32::from_le_bytes(mb[4..8].try_into().unwrap());
+            pos += 8;
+            indexes.push(IndexInfo {
+                name: iname,
+                column,
+                m,
+                ef_construction,
+            });
+        }
+    }
     Ok(TableSchema {
         name: name.to_string(),
         columns,
         root,
         next_rowid,
         row_count,
+        indexes,
     })
 }
 

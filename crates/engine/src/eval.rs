@@ -41,7 +41,64 @@ where
         Expr::Aggregate { .. } => Err(EngineError::Unsupported(
             "aggregate function not allowed here".into(),
         )),
+        Expr::Distance { left, right } => {
+            let l = eval_with(left, leaf)?;
+            let r = eval_with(right, leaf)?;
+            if matches!(l, Value::Null) || matches!(r, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let (a, b) = (as_vector(l)?, as_vector(r)?);
+            if a.len() != b.len() {
+                return Err(EngineError::Type(format!(
+                    "distance() dimension mismatch: {} vs {}",
+                    a.len(),
+                    b.len()
+                )));
+            }
+            // Squared L2 through the same runtime-dispatched kernels the
+            // index uses — the exact scan and the index scan agree by
+            // construction. This is the exact path; the planner swaps in
+            // the HNSW access when an index exists.
+            let k = vector::distance::kernels();
+            Ok(Value::Real(
+                k.distance(vector::distance::Metric::L2, &a, &b) as f64,
+            ))
+        }
     }
+}
+
+/// Coerce a runtime value to a vector: either a `Value::Vector` already or a
+/// pgvector-style text literal `'[0.1, 0.2, ...]'`.
+fn as_vector(v: Value) -> Result<Vec<f32>, EngineError> {
+    match v {
+        Value::Vector(x) => Ok(x),
+        Value::Text(s) => parse_vector_text(&s),
+        other => Err(EngineError::Type(format!(
+            "expected VECTOR or '[...]' text literal, got {other:?}"
+        ))),
+    }
+}
+
+/// Parse `'[1.0, 2.5, -3]'` (pgvector's literal syntax) into floats.
+pub fn parse_vector_text(s: &str) -> Result<Vec<f32>, EngineError> {
+    let inner = s
+        .trim()
+        .strip_prefix('[')
+        .and_then(|t| t.strip_suffix(']'))
+        .ok_or_else(|| {
+            EngineError::Type(format!("bad vector literal '{s}': expected '[a, b, ...]'"))
+        })?;
+    if inner.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    inner
+        .split(',')
+        .map(|part| {
+            part.trim()
+                .parse::<f32>()
+                .map_err(|_| EngineError::Type(format!("bad vector element '{}'", part.trim())))
+        })
+        .collect()
 }
 
 /// Evaluate `expr` against a single-table `row` (column order matches `schema`).

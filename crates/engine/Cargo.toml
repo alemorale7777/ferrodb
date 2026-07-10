@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 storage = { path = "../storage" }
 sql = { path = "../sql" }
+vector = { path = "../vector" }
 thiserror = "1"
 
 [dev-dependencies]

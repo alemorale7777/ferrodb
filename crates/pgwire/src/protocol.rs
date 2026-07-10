@@ -42,7 +42,8 @@ fn pg_type(v: &Value) -> PgType {
             oid: OID_BOOL,
             size: 1,
         },
-        Value::Text(_) | Value::Null => PgType {
+        // Vectors render as their pgvector-style text form '[a, b, ...]'.
+        Value::Text(_) | Value::Vector(_) | Value::Null => PgType {
             oid: OID_TEXT,
             size: -1,
         },
@@ -73,6 +74,10 @@ pub fn encode_value(v: &Value) -> Option<Vec<u8>> {
         Value::Real(x) => Some(x.to_string().into_bytes()),
         Value::Boolean(b) => Some(if *b { b"t".to_vec() } else { b"f".to_vec() }),
         Value::Text(s) => Some(s.clone().into_bytes()),
+        Value::Vector(v) => {
+            let inner: Vec<String> = v.iter().map(|x| x.to_string()).collect();
+            Some(format!("[{}]", inner.join(", ")).into_bytes())
+        }
     }
 }
 

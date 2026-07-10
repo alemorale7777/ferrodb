@@ -25,7 +25,7 @@ use storage::meta::MetaPage;
 use storage::page::PageId;
 use storage::wal::Wal;
 
-use catalog::{ColumnInfo, TableSchema};
+use catalog::{ColumnInfo, IndexInfo, TableSchema};
 use mvcc::Version;
 use plan::{Access, Col, Plan, RowSet};
 use txn::{Snapshot, Status, TxnManager};
@@ -81,6 +81,12 @@ pub struct Database {
     wal: Wal,
     mgr: TxnManager,
     write_sets: HashMap<TxnId, Vec<(String, Vec<u8>)>>,
+    /// Data-file path; sidecar index files derive from it (None: in-memory).
+    base_path: Option<PathBuf>,
+    /// Live HNSW indexes, keyed `"table\0column"` (lowercased). Loaded from
+    /// sidecars lazily; rebuilt from the base table when missing or stale —
+    /// the index is derived data, the table is the source of truth.
+    hnsw: HashMap<String, vector::hnsw::Hnsw>,
 }
 
 impl Database {
@@ -93,16 +99,20 @@ impl Database {
         let mut dm = DiskManager::open(data_path)?;
         let mut wal = Wal::open(&wal_path)?;
         wal.recover(&mut dm)?;
-        Database::from_parts(dm, wal)
+        Database::from_parts(dm, wal, Some(data_path.to_path_buf()))
     }
 
     /// Open a database backed entirely by memory — no filesystem, no persistence.
     /// This is what lets the engine run in the browser (WebAssembly).
     pub fn open_in_memory() -> Result<Database, EngineError> {
-        Database::from_parts(DiskManager::in_memory(), Wal::in_memory())
+        Database::from_parts(DiskManager::in_memory(), Wal::in_memory(), None)
     }
 
-    fn from_parts(dm: DiskManager, wal: Wal) -> Result<Database, EngineError> {
+    fn from_parts(
+        dm: DiskManager,
+        wal: Wal,
+        base_path: Option<PathBuf>,
+    ) -> Result<Database, EngineError> {
         let mut bp = BufferPool::new(dm, 256);
         bp.set_no_steal(true);
         let meta = load_meta(&mut bp)?;
@@ -112,6 +122,8 @@ impl Database {
             wal,
             mgr: TxnManager::new(1),
             write_sets: HashMap::new(),
+            base_path,
+            hnsw: HashMap::new(),
         };
         // Resume transaction ids past anything already stored (derived, not persisted).
         let next = db.max_txn_id()? + 1;
@@ -247,8 +259,9 @@ impl Database {
         })
     }
 
-    /// Flush all pages and persist the meta record.
+    /// Flush all pages and persist the meta record (and index sidecars).
     pub fn checkpoint(&mut self) -> Result<(), EngineError> {
+        self.save_indexes()?;
         self.bp.flush_all()?;
         let mut mp = self.meta.encode();
         self.bp.disk_mut().write_page(PageId(0), &mut mp)?;
@@ -366,11 +379,222 @@ impl Database {
             .ok_or_else(|| EngineError::UnknownTable(name.to_string()))
     }
 
+    // ---- vector indexes (M9) ----------------------------------------------
+    //
+    // The HNSW index is a *secondary* index: it maps vectors to row keys, and
+    // rows are fetched through the primary B+-tree — the same division of
+    // labor pgvector has with Postgres's heap. The index is not MVCC-aware:
+    // it may return keys for rows a snapshot cannot see (aborted inserts,
+    // concurrent writers); the B+-tree fetch applies `mvcc::visible_index`
+    // and silently drops them, exactly as Postgres drops dead TIDs after a
+    // heap fetch. Deletes tombstone the index node (it keeps routing, stops
+    // being returned); a rebuild reclaims tombstones.
+
+    fn index_map_key(table: &str, column: &str) -> String {
+        format!(
+            "{}\0{}",
+            table.to_ascii_lowercase(),
+            column.to_ascii_lowercase()
+        )
+    }
+
+    /// `<data-file>.hnsw-<table>-<column>` next to the database file.
+    fn sidecar_path(&self, table: &str, column: &str) -> Option<PathBuf> {
+        let base = self.base_path.as_ref()?;
+        let mut name = base.as_os_str().to_owned();
+        name.push(format!(
+            ".hnsw-{}-{}",
+            table.to_ascii_lowercase(),
+            column.to_ascii_lowercase()
+        ));
+        Some(PathBuf::from(name))
+    }
+
+    fn vector_dim(schema: &TableSchema, column: &str) -> Option<u16> {
+        let i = schema.column_index(column)?;
+        match schema.columns[i].data_type {
+            DataType::Vector(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// Build a fresh index over the newest version of every row key. Version
+    /// chains share one key; we index the newest vector and let MVCC filter
+    /// at fetch time (a snapshot that should see an older version still gets
+    /// the row — ranked by the newest vector, a slight staleness we accept
+    /// and document rather than versioning the index).
+    fn build_hnsw(
+        &mut self,
+        schema: &TableSchema,
+        ix: &IndexInfo,
+        dim: u16,
+    ) -> Result<vector::hnsw::Hnsw, EngineError> {
+        let params = vector::hnsw::HnswParams {
+            m: ix.m as usize,
+            m_max0: 2 * ix.m as usize,
+            ef_construction: ix.ef_construction as usize,
+        };
+        let mut idx = vector::hnsw::Hnsw::new(
+            dim as usize,
+            vector::distance::Metric::L2,
+            params,
+            0xFE44_0DB0,
+        );
+        let types = schema.types();
+        let col = schema
+            .column_index(&ix.column)
+            .ok_or_else(|| EngineError::UnknownColumn(ix.column.clone()))?;
+        for (key, chain) in self.table_scan(schema.root)? {
+            let Some(v) = chain.last() else { continue };
+            let row = tuple::decode_tuple(&types, &v.data)?;
+            if let Value::Vector(vec) = &row[col] {
+                idx.insert(vec, &key);
+            }
+        }
+        Ok(idx)
+    }
+
+    /// Make sure the index for (`table`, `ix`) is resident: use the loaded
+    /// one, else load the sidecar (rejecting a stale or torn file), else
+    /// rebuild from the table. Rebuild-on-mismatch is what makes skipping
+    /// per-commit sidecar writes safe: the sidecar is only a warm-start.
+    fn ensure_hnsw(
+        &mut self,
+        table: &str,
+        ix: &IndexInfo,
+        dim: u16,
+        schema: &TableSchema,
+    ) -> Result<(), EngineError> {
+        let key = Self::index_map_key(table, &ix.column);
+        if self.hnsw.contains_key(&key) {
+            return Ok(());
+        }
+        // Freshness bar: the index must hold exactly one node per row key
+        // (minus nothing — tombstones stay as nodes). Chain count is that
+        // upper bound; mismatch ⇒ the sidecar predates some insert ⇒ rebuild.
+        let nkeys = self.table_scan(schema.root)?.len();
+        if let Some(p) = self.sidecar_path(table, &ix.column) {
+            if let Ok(loaded) = vector::hnsw::Hnsw::load(&p) {
+                if loaded.len() == nkeys && loaded.dim() == dim as usize {
+                    self.hnsw.insert(key, loaded);
+                    return Ok(());
+                }
+            }
+        }
+        let built = self.build_hnsw(schema, ix, dim)?;
+        self.hnsw.insert(key, built);
+        Ok(())
+    }
+
+    /// Persist every resident index to its sidecar (no-op in memory).
+    fn save_indexes(&mut self) -> Result<(), EngineError> {
+        if self.base_path.is_none() {
+            return Ok(());
+        }
+        let keys: Vec<String> = self.hnsw.keys().cloned().collect();
+        for key in keys {
+            let (table, column) = key.split_once('\0').expect("map key shape");
+            if let Some(p) = self.sidecar_path(table, column) {
+                self.hnsw[&key]
+                    .save(&p)
+                    .map_err(|e| EngineError::Other(format!("saving index: {e}")))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn exec_create_index(
+        &mut self,
+        _txn: TxnId,
+        name: String,
+        table: String,
+        column: String,
+    ) -> Result<Output, EngineError> {
+        let mut schema = self.schema_of(&table)?;
+        let Some(dim) = Self::vector_dim(&schema, &column) else {
+            return Err(EngineError::Unsupported(format!(
+                "HNSW index requires a VECTOR column; '{column}' is not one"
+            )));
+        };
+        if schema.indexes.iter().any(|ix| {
+            ix.name.eq_ignore_ascii_case(&name) || ix.column.eq_ignore_ascii_case(&column)
+        }) {
+            return Err(EngineError::Other(format!(
+                "an index named '{name}' or covering '{column}' already exists"
+            )));
+        }
+        let ix = IndexInfo {
+            name,
+            column: column.clone(),
+            m: 16,
+            ef_construction: 200,
+        };
+        let built = self.build_hnsw(&schema, &ix, dim)?;
+        if let Some(p) = self.sidecar_path(&table, &column) {
+            built
+                .save(&p)
+                .map_err(|e| EngineError::Other(format!("saving index: {e}")))?;
+        }
+        self.hnsw
+            .insert(Self::index_map_key(&table, &column), built);
+        schema.indexes.push(ix);
+        catalog::put_table(&mut self.bp, &mut self.meta, &schema)?;
+        Ok(Output::Ack("CREATE INDEX"))
+    }
+
+    /// After a row lands in the B+-tree: mirror its vector into each index.
+    /// Runs at insert time, not commit time — an abort leaves a ghost the
+    /// MVCC fetch filters out (Postgres semantics; see module comment).
+    fn hnsw_after_insert(
+        &mut self,
+        schema: &TableSchema,
+        key: &[u8],
+        row: &[Value],
+    ) -> Result<(), EngineError> {
+        if schema.indexes.is_empty() {
+            return Ok(());
+        }
+        for ix in schema.indexes.clone() {
+            let Some(dim) = Self::vector_dim(schema, &ix.column) else {
+                continue;
+            };
+            let Some(col) = schema.column_index(&ix.column) else {
+                continue;
+            };
+            if let Value::Vector(v) = &row[col] {
+                self.ensure_hnsw(&schema.name, &ix, dim, schema)?;
+                let mkey = Self::index_map_key(&schema.name, &ix.column);
+                self.hnsw
+                    .get_mut(&mkey)
+                    .expect("just ensured")
+                    .insert(v, key);
+            }
+        }
+        Ok(())
+    }
+
+    /// After DELETE stamps tombstones: tombstone the index nodes too.
+    fn hnsw_after_delete(&mut self, schema: &TableSchema, keys: &[Vec<u8>]) {
+        for ix in &schema.indexes {
+            let mkey = Self::index_map_key(&schema.name, &ix.column);
+            if let Some(idx) = self.hnsw.get_mut(&mkey) {
+                for k in keys {
+                    idx.delete_by_key(k);
+                }
+            }
+        }
+    }
+
     // ---- dispatch ---------------------------------------------------------
 
     fn dispatch(&mut self, txn: TxnId, stmt: Statement) -> Result<Output, EngineError> {
         match stmt {
             Statement::CreateTable { name, columns } => self.exec_create(name, columns),
+            Statement::CreateIndex {
+                name,
+                table,
+                column,
+            } => self.exec_create_index(txn, name, table, column),
             Statement::DropTable { name } => self.exec_drop(name),
             Statement::Insert {
                 table,
@@ -420,6 +644,7 @@ impl Database {
             root: data_root,
             next_rowid: 1,
             row_count: 0,
+            indexes: Vec::new(),
         };
         catalog::put_table(&mut self.bp, &mut self.meta, &schema)?;
         Ok(Output::Ack("CREATE TABLE"))
@@ -506,6 +731,9 @@ impl Database {
             // through table_put_chain carries the new count into the catalog.
             schema.row_count += 1;
             self.table_put_chain(&mut schema, &key, &chain)?;
+            // Mirror the vector into any HNSW index (M9) — see the vector
+            // indexes section for the ghost/abort semantics.
+            self.hnsw_after_insert(&schema, &key, &row)?;
             self.write_sets
                 .get_mut(&txn)
                 .expect("active txn")
@@ -587,6 +815,14 @@ impl Database {
         } else {
             build_join_tree_baseline(&rels, sel)
         };
+
+        // M9: `ORDER BY distance(col, <const>) LIMIT k` over a single table
+        // whose `col` has an HNSW index becomes an approximate top-k index
+        // scan. Only the *access path* changes: the Sort above re-orders the
+        // candidates exactly and Limit truncates, so the index can only
+        // affect which candidates are considered, never their ordering —
+        // the same contract pgvector's index scans have.
+        self.try_vector_access(&mut node, sel, &rels);
 
         // Aggregation, if any aggregate appears or GROUP BY is present.
         let mut aggs = Vec::new();
@@ -699,6 +935,57 @@ impl Database {
         Ok(node)
     }
 
+    /// See `build_plan`: swap a Seq scan for an HNSW top-k access when the
+    /// query is a k-NN pattern the index can serve.
+    fn try_vector_access(&mut self, node: &mut Plan, sel: &Select, rels: &[Rel]) {
+        if rels.len() != 1
+            || !sel.joins.is_empty()
+            || !sel.group_by.is_empty()
+            || sel.having.is_some()
+            || sel.order_by.len() != 1
+            || sel.order_by[0].descending
+        {
+            return;
+        }
+        let Some(limit) = sel.limit else { return };
+        let Expr::Distance { left, right } = &sel.order_by[0].expr else {
+            return;
+        };
+        let rel = &rels[0];
+        // One side must be the indexed column, the other a constant.
+        let col_of = |e: &Expr| -> Option<String> {
+            if let Expr::Column { table, name } = e {
+                let alias_ok = table
+                    .as_deref()
+                    .is_none_or(|t| t.eq_ignore_ascii_case(&rel.alias));
+                if alias_ok && Self::vector_dim(&rel.schema, name).is_some() {
+                    return Some(name.clone());
+                }
+            }
+            None
+        };
+        let (column, query) = match (col_of(left), col_of(right)) {
+            (Some(c), None) if is_const(right) => (c, (**right).clone()),
+            (None, Some(c)) if is_const(left) => (c, (**left).clone()),
+            _ => return,
+        };
+        if !rel
+            .schema
+            .indexes
+            .iter()
+            .any(|ix| ix.column.eq_ignore_ascii_case(&column))
+        {
+            return;
+        }
+        let k = (limit + sel.offset.unwrap_or(0)) as usize;
+        if let Plan::Scan { access, est, .. } = node {
+            if matches!(access, Access::Seq) {
+                *access = Access::VectorTopK { column, query, k };
+                *est = k as f64;
+            }
+        }
+    }
+
     fn run_plan(&mut self, plan: &Plan, snap: &Snapshot) -> Result<RowSet, EngineError> {
         match plan {
             Plan::Scan {
@@ -708,7 +995,7 @@ impl Database {
                 filter,
                 ..
             } => {
-                let rs = self.exec_scan(table, alias, access, snap)?;
+                let rs = self.exec_scan(table, alias, access, filter.as_ref(), snap)?;
                 match filter {
                     Some(p) => plan::filter_rows(rs, p),
                     None => Ok(rs),
@@ -769,11 +1056,15 @@ impl Database {
     }
 
     /// Materialise a base relation's MVCC-visible rows as a `RowSet`.
+    /// `residual` is the scan's pushed-down filter: most access paths ignore
+    /// it (run_plan applies it after), but the HNSW path threads it into the
+    /// graph traversal — predicate-aware search, not post-hoc filtering.
     fn exec_scan(
         &mut self,
         table: &str,
         alias: &str,
         access: &Access,
+        residual: Option<&Expr>,
         snap: &Snapshot,
     ) -> Result<RowSet, EngineError> {
         let schema = self.schema_of(table)?;
@@ -806,6 +1097,9 @@ impl Database {
                     }
                 }
             }
+            Access::VectorTopK { column, query, k } => {
+                rows = self.exec_vector_topk(&schema, &types, column, query, *k, residual, snap)?;
+            }
             Access::IndexRange { lo, hi } => {
                 // Encode the bounds (order-preserving PK keys) and let the
                 // B+-tree seek straight to the starting leaf and walk the sibling
@@ -835,6 +1129,126 @@ impl Database {
             }
         }
         Ok(RowSet { schema: cols, rows })
+    }
+
+    /// Execute an HNSW top-k access (M9), the heart of filtered vector search.
+    ///
+    /// Unfiltered: beam-search the graph, fetch the returned row keys through
+    /// the B+-tree, keep the MVCC-visible ones.
+    ///
+    /// Filtered (`residual` present): the predicate rides *inside* the
+    /// traversal (`search_filtered`): non-matching nodes still route the beam
+    /// but cannot enter the result set. This is the mitigation for the
+    /// post-filter recall cliff — filtering *after* a plain top-k search dies
+    /// when the predicate is selective (top-k nearest may contain zero
+    /// matches); filtering *candidate admission but not traversal* keeps the
+    /// beam connected through non-matching regions. If the beam still comes
+    /// back short (ultra-selective predicate), `ef` escalates ×4 until it
+    /// covers the graph — at which point the search has degenerated into an
+    /// exact filtered scan, which is precisely the right fallback.
+    #[allow(clippy::too_many_arguments)]
+    fn exec_vector_topk(
+        &mut self,
+        schema: &TableSchema,
+        types: &[DataType],
+        column: &str,
+        query: &Expr,
+        k: usize,
+        residual: Option<&Expr>,
+        snap: &Snapshot,
+    ) -> Result<Vec<Vec<Value>>, EngineError> {
+        let ix = schema
+            .indexes
+            .iter()
+            .find(|ix| ix.column.eq_ignore_ascii_case(column))
+            .cloned()
+            .ok_or_else(|| EngineError::Other("planner chose a missing index".into()))?;
+        let dim = Self::vector_dim(schema, column)
+            .ok_or_else(|| EngineError::Type(format!("'{column}' is not a vector column")))?;
+        self.ensure_hnsw(&schema.name, &ix, dim, schema)?;
+
+        // The query vector: a constant expression ('[...]' text or vector).
+        let qv = match eval::eval(query, &empty_schema(), &[])? {
+            Value::Vector(v) => v,
+            Value::Text(s) => eval::parse_vector_text(&s)?,
+            other => {
+                return Err(EngineError::Type(format!(
+                    "distance() query must be a vector, got {other:?}"
+                )))
+            }
+        };
+        if qv.len() != dim as usize {
+            return Err(EngineError::Type(format!(
+                "query vector has {} dimensions, column '{column}' has {dim}",
+                qv.len()
+            )));
+        }
+
+        // Take the index out of the map so the traversal closure may borrow
+        // `self` mutably for B+-tree probes (visibility + predicate checks).
+        let mkey = Self::index_map_key(&schema.name, column);
+        let idx = self.hnsw.remove(&mkey).expect("just ensured");
+        let n = idx.len().max(1);
+        let mut ef = (4 * k).max(64);
+        let result = loop {
+            let found = match residual {
+                None => idx.search(&qv, k, ef),
+                Some(pred) => {
+                    let mut pass = |_id: u32, keyb: &[u8]| -> bool {
+                        self.probe_predicate(schema, types, keyb, pred, snap)
+                            .unwrap_or(false)
+                    };
+                    idx.search_filtered(&qv, k, ef, &mut pass)
+                }
+            };
+            // Enough results, or the beam already spans the whole graph
+            // (ef ≥ 2n ⇒ the "approximate" search became exhaustive).
+            if found.len() >= k || ef >= 2 * n {
+                break found;
+            }
+            ef *= 4;
+        };
+        self.hnsw.insert(mkey, idx);
+
+        // Resolve row keys through the primary B+-tree, under the snapshot.
+        let mut rows = Vec::with_capacity(result.len());
+        let root = schema.root;
+        for (_d, id) in &result {
+            let keyb = {
+                // Re-borrow through the map (idx moved back in).
+                let idx = self.hnsw.get(&Self::index_map_key(&schema.name, column));
+                idx.expect("resident").key(*id).to_vec()
+            };
+            if let Some(chain) = self.table_get_chain(root, &keyb)? {
+                if let Some(i) = mvcc::visible_index(&chain, snap, &self.mgr) {
+                    rows.push(tuple::decode_tuple(types, &chain[i].data)?);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Is the row behind `keyb` visible under `snap` AND passing `pred`?
+    /// Used as the admission test inside filtered graph traversal.
+    fn probe_predicate(
+        &mut self,
+        schema: &TableSchema,
+        types: &[DataType],
+        keyb: &[u8],
+        pred: &Expr,
+        snap: &Snapshot,
+    ) -> Result<bool, EngineError> {
+        let Some(chain) = self.table_get_chain(schema.root, keyb)? else {
+            return Ok(false);
+        };
+        let Some(i) = mvcc::visible_index(&chain, snap, &self.mgr) else {
+            return Ok(false);
+        };
+        let row = tuple::decode_tuple(types, &chain[i].data)?;
+        Ok(matches!(
+            eval::eval(pred, schema, &row)?,
+            Value::Boolean(true)
+        ))
     }
 
     // ---- UPDATE / DELETE --------------------------------------------------
@@ -891,8 +1305,20 @@ impl Database {
         }
 
         let count = ops.len();
+        // If an indexed vector column was assigned, the index must follow:
+        // tombstone the old node, insert the new vector under the same key.
+        let reindex = schema.indexes.iter().any(|ix| {
+            assignments
+                .iter()
+                .any(|(c, _)| c.eq_ignore_ascii_case(&ix.column))
+        });
         for (key, chain) in ops {
             self.table_put_chain(&mut schema, &key, &chain)?;
+            if reindex {
+                self.hnsw_after_delete(&schema, std::slice::from_ref(&key));
+                let newrow = tuple::decode_tuple(&types, &chain.last().expect("just pushed").data)?;
+                self.hnsw_after_insert(&schema, &key, &newrow)?;
+            }
             self.write_sets
                 .get_mut(&txn)
                 .expect("active txn")
@@ -939,6 +1365,7 @@ impl Database {
         // Decrement the cardinality statistic before persisting the tombstoned
         // chains, so each table_put_chain carries the new count into the catalog.
         schema.row_count = schema.row_count.saturating_sub(count as u64);
+        let deleted_keys: Vec<Vec<u8>> = ops.iter().map(|(k, _)| k.clone()).collect();
         for (key, chain) in ops {
             self.table_put_chain(&mut schema, &key, &chain)?;
             self.write_sets
@@ -946,6 +1373,8 @@ impl Database {
                 .expect("active txn")
                 .push((table.clone(), key));
         }
+        // Tombstone the index nodes (they keep routing, stop being returned).
+        self.hnsw_after_delete(&schema, &deleted_keys);
         Ok(Output::Affected(count))
     }
 }
@@ -959,6 +1388,7 @@ fn empty_schema() -> TableSchema {
         root: PageId(0),
         next_rowid: 0,
         row_count: 0,
+        indexes: Vec::new(),
     }
 }
 
@@ -1034,6 +1464,10 @@ fn collect_cols(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
             collect_cols(right, out);
         }
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => collect_cols(expr, out),
+        Expr::Distance { left, right } => {
+            collect_cols(left, out);
+            collect_cols(right, out);
+        }
         Expr::Aggregate { arg, .. } => {
             if let Some(a) = arg {
                 collect_cols(a, out);
@@ -1447,6 +1881,29 @@ fn coerce(v: Value, col: &ColumnInfo) -> Result<Value, EngineError> {
                 col.name
             ))),
         },
+        DataType::Vector(dim) => {
+            let vec = match v {
+                Value::Null => return null_ok(col),
+                Value::Vector(x) => x,
+                // pgvector-style: a quoted text literal '[0.1, 0.2, ...]'.
+                Value::Text(s) => eval::parse_vector_text(&s)?,
+                other => {
+                    return Err(EngineError::Type(format!(
+                        "column '{}' expects VECTOR({dim}), got {other:?}",
+                        col.name
+                    )))
+                }
+            };
+            // The dimension is part of the type: enforce it at the door.
+            if vec.len() != dim as usize {
+                return Err(EngineError::Type(format!(
+                    "column '{}' expects VECTOR({dim}), got a {}-dimensional value",
+                    col.name,
+                    vec.len()
+                )));
+            }
+            Ok(Value::Vector(vec))
+        }
     }
 }
 

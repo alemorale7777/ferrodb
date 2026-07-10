@@ -55,6 +55,10 @@ fn output_to_json(out: &Output) -> String {
 fn value_to_json(v: &Value) -> String {
     match v {
         Value::Null => "null".to_string(),
+        Value::Vector(v) => {
+            let inner: Vec<String> = v.iter().map(|x| x.to_string()).collect();
+            format!("[{}]", inner.join(", "))
+        }
         Value::Integer(x) => x.to_string(),
         Value::Real(x) => {
             if x.is_finite() {

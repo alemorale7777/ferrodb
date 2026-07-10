@@ -25,6 +25,12 @@ pub fn encode_tuple(row: &[Value]) -> Vec<u8> {
                 out.extend_from_slice(&(s.len() as u32).to_le_bytes());
                 out.extend_from_slice(s.as_bytes());
             }
+            Value::Vector(v) => {
+                out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                for x in v {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
         }
     }
     out
@@ -69,6 +75,18 @@ pub fn decode_tuple(types: &[DataType], bytes: &[u8]) -> Result<Vec<Value>, Engi
                 ));
                 pos += len;
             }
+            DataType::Vector(_) => {
+                let lb = bytes.get(pos..pos + 4).ok_or_else(corrupt)?;
+                let len = u32::from_le_bytes(lb.try_into().unwrap()) as usize;
+                pos += 4;
+                let vb = bytes.get(pos..pos + len * 4).ok_or_else(corrupt)?;
+                let mut v = Vec::with_capacity(len);
+                for c in vb.chunks_exact(4) {
+                    v.push(f32::from_le_bytes(c.try_into().unwrap()));
+                }
+                row.push(Value::Vector(v));
+                pos += len * 4;
+            }
         }
     }
     Ok(row)
@@ -81,6 +99,7 @@ pub fn value_to_key(v: &Value) -> Result<Vec<u8>, EngineError> {
         Value::Text(s) => Ok(s.as_bytes().to_vec()),
         Value::Boolean(b) => Ok(vec![if *b { 1 } else { 0 }]),
         Value::Real(_) => Err(EngineError::Unsupported("REAL primary key".into())),
+        Value::Vector(_) => Err(EngineError::Unsupported("VECTOR primary key".into())),
         Value::Null => Err(EngineError::Constraint("primary key cannot be NULL".into())),
     }
 }

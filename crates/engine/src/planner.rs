@@ -15,7 +15,7 @@ pub fn collect_aggs_in(e: &Expr, out: &mut Vec<Expr>) {
                 out.push(e.clone());
             }
         }
-        Expr::Binary { left, right, .. } => {
+        Expr::Binary { left, right, .. } | Expr::Distance { left, right } => {
             collect_aggs_in(left, out);
             collect_aggs_in(right, out);
         }
@@ -46,6 +46,10 @@ pub fn substitute(e: &Expr, subs: &[(Expr, Expr)]) -> Expr {
             expr: Box::new(substitute(expr, subs)),
             negated: *negated,
         },
+        Expr::Distance { left, right } => Expr::Distance {
+            left: Box::new(substitute(left, subs)),
+            right: Box::new(substitute(right, subs)),
+        },
         other => other.clone(),
     }
 }
@@ -54,6 +58,7 @@ pub fn substitute(e: &Expr, subs: &[(Expr, Expr)]) -> Expr {
 pub fn default_name(e: &Expr) -> String {
     match e {
         Expr::Column { name, .. } => name.clone(),
+        Expr::Distance { .. } => "distance".to_string(),
         Expr::Aggregate { func, .. } => match func {
             AggFunc::Count => "count",
             AggFunc::Sum => "sum",
@@ -73,7 +78,7 @@ pub fn validate_cols(e: &Expr, scope: &[Col]) -> Result<(), EngineError> {
             resolve_col(scope, table.as_deref(), name)?;
             Ok(())
         }
-        Expr::Binary { left, right, .. } => {
+        Expr::Binary { left, right, .. } | Expr::Distance { left, right } => {
             validate_cols(left, scope)?;
             validate_cols(right, scope)
         }
@@ -91,7 +96,9 @@ pub fn expr_resolves(e: &Expr, cols: &[Col]) -> bool {
     match e {
         Expr::Column { table, name } => resolve_col(cols, table.as_deref(), name).is_ok(),
         Expr::Literal(_) => true,
-        Expr::Binary { left, right, .. } => expr_resolves(left, cols) && expr_resolves(right, cols),
+        Expr::Binary { left, right, .. } | Expr::Distance { left, right } => {
+            expr_resolves(left, cols) && expr_resolves(right, cols)
+        }
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => expr_resolves(expr, cols),
         Expr::Aggregate { .. } => false,
     }

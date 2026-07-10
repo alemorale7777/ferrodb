@@ -8,13 +8,46 @@ B+-tree crate: the point is to build the machine, not glue one together.
 📖 **[Read the architecture book →](https://alemorale7777.github.io/ferrodb/)** — a chapter-by-chapter
 tour of the whole engine, bottom-up.
 
-> **Status:** All 8 milestones complete and green — it runs real SQL with joins and
+> **Status:** All 9 milestones complete and green — it runs real SQL with joins and
 > grouped aggregation, persisted to disk, survives a crash, gives concurrent transactions
 > snapshot isolation, plans queries with a cost-based optimizer, speaks the
 > **PostgreSQL wire protocol** so `psql` can connect, compiles to **WebAssembly** to run
 > in the browser, and ships a **SQLite-comparison benchmark** and an **mdBook architecture
 > book**. See the
 > [full design & roadmap](docs/superpowers/specs/2026-07-02-ferrodb-design.md).
+
+## Milestone 9 — HNSW vector index & filtered vector search ✅
+
+ferrodb answers **semantic-search queries** with an **HNSW approximate-nearest-neighbor
+index** (Malkov & Yashunin — the algorithm behind pgvector, Qdrant, Weaviate, FAISS),
+implemented from scratch as a secondary index the way pgvector extends Postgres: the index
+returns row keys, the primary B+-tree resolves rows, and MVCC visibility filters at fetch —
+an aborted transaction's "ghost" vector is provably never returned.
+
+```sql
+CREATE TABLE items (id INTEGER PRIMARY KEY, category TEXT, embedding VECTOR(768));
+CREATE INDEX items_emb ON items USING HNSW (embedding);
+SELECT id FROM items WHERE category = 'docs'
+ORDER BY distance(embedding, '[0.02, -0.31, ...]') LIMIT 10;   -- EXPLAIN: HnswTopK
+```
+
+The hot loop is a **hand-written AVX2+FMA kernel** behind runtime CPU detection (scalar
+fallback, property-tested to match within float-rounding epsilon): **7-9x faster** distance
+computations. The graph persists to a **checksummed sidecar with an mmap'd vector arena**
+(raw `mmap` FFI, no libc crate) and rebuilds from the table when missing, torn, or stale —
+the index is derived data; the WAL-protected table is the source of truth. **Filtered
+vector search** (`WHERE` + k-NN in one engine) threads the predicate into the graph
+traversal — non-matching nodes still route the beam but can't enter results — dodging the
+post-filter recall cliff; with an ultra-selective predicate, `ef` escalates until the search
+degenerates into an exact filtered scan (a one-in-300 needle is a passing test).
+
+A **recall harness** proves correctness the way ANN work demands: brute-force ground truth,
+distance-counted recall@10 (an id-based counter mis-scored tied duplicates — diagnosed and
+documented), `ef_search` sweep: **recall@10 = 1.000** on the easy regime, 0.50-0.99 on
+deliberately adversarial clustered Gaussians at 2,500-37,000 QPS single-threaded. The
+[architecture book](docs/book/) chapter and a 30-question
+[interview Q&A bank](docs/interview-qa-vector-index.md) document every design decision and
+its rejected alternatives.
 
 ## Milestone 8 — Benchmarks & architecture book ✅
 
@@ -215,11 +248,13 @@ Built bottom-up; each milestone is an independently testable, demoable artifact.
 | **M6** | **PostgreSQL wire protocol** ✅ | connect with real `psql`; simple query · transactions · hand-rolled v3 framing |
 | **M7** | **WASM web playground** ✅ | in-browser engine (hand-rolled C ABI) + live B+-tree visualizer |
 | **M8** | **Benchmarks + docs** ✅ | SQLite comparison · mdBook architecture book |
+| **M9** | **HNSW vector index** ✅ | `VECTOR(dim)` type · SIMD kernels · filtered k-NN · mmap sidecar · recall harness |
 
 ## Layout
 
 ```
 crates/storage   disk · buffer pool · slotted pages · B+-tree · WAL + recovery
+crates/vector    HNSW vector index · SIMD distance kernels · mmap persistence · recall harness
 crates/sql       lexer · Pratt parser · AST
 crates/engine    catalog · tuple codec · evaluator · MVCC · planner + optimizer · executor
 crates/pgwire    PostgreSQL wire protocol server (ferrodb-pg)

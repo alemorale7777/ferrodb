@@ -98,6 +98,7 @@ pub fn value_type(v: &Value) -> DataType {
         Value::Real(_) => DataType::Real,
         Value::Text(_) => DataType::Text,
         Value::Boolean(_) => DataType::Boolean,
+        Value::Vector(v) => DataType::Vector(v.len() as u16),
         Value::Null => DataType::Integer,
     }
 }
@@ -122,6 +123,15 @@ fn hash_key(v: &Value) -> Option<Vec<u8>> {
             k
         }
         Value::Boolean(b) => vec![3u8, *b as u8],
+        Value::Vector(v) => {
+            // Vectors can be grouped/joined on exact bit equality (the only
+            // sane equality for floats used as keys).
+            let mut k = vec![4u8];
+            for x in v {
+                k.extend_from_slice(&x.to_bits().to_le_bytes());
+            }
+            k
+        }
     })
 }
 
@@ -434,6 +444,16 @@ pub enum Access {
     /// residual `filter` still applies, so these bounds only prune the range —
     /// the exact predicate semantics come from the filter.
     IndexRange { lo: Option<Expr>, hi: Option<Expr> },
+    /// HNSW approximate top-k scan (M9): fetch the ~k nearest rows to `query`
+    /// by `column`, resolved through the primary B+-tree. Approximate — the
+    /// plan's Sort/Limit above re-order and truncate the candidates exactly,
+    /// and the scan's residual filter (if any) is applied predicate-aware
+    /// inside the traversal (see `Database::exec_scan`).
+    VectorTopK {
+        column: String,
+        query: Expr,
+        k: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -526,6 +546,10 @@ impl Plan {
                     Access::IndexSeek { op, key } => {
                         format!("IndexSeek {named} (pk {} {})", fmt_op(*op), fmt_expr(key))
                     }
+                    Access::VectorTopK { column, query, k } => format!(
+                        "HnswTopK {named} (distance({column}, {}) LIMIT {k})",
+                        fmt_expr(query)
+                    ),
                     Access::IndexRange { lo, hi } => {
                         let bound = match (lo, hi) {
                             (Some(l), Some(h)) => {
@@ -656,6 +680,14 @@ fn fmt_val(v: &Value) -> String {
         Value::Real(x) => x.to_string(),
         Value::Text(s) => format!("'{s}'"),
         Value::Boolean(b) => b.to_string(),
+        Value::Vector(v) => {
+            // Keep EXPLAIN lines readable for wide vectors.
+            if v.len() > 4 {
+                format!("[{}, {}, ... ({} dims)]", v[0], v[1], v.len())
+            } else {
+                format!("{v:?}")
+            }
+        }
     }
 }
 
@@ -684,6 +716,9 @@ pub fn fmt_expr(e: &Expr) -> String {
                 fmt_expr(expr),
                 if *negated { "NOT " } else { "" }
             )
+        }
+        Expr::Distance { left, right } => {
+            format!("distance({}, {})", fmt_expr(left), fmt_expr(right))
         }
         Expr::Aggregate { func, arg } => {
             let name = match func {

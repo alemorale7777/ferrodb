@@ -14,6 +14,10 @@ fn render_value(v: &Value) -> String {
         Value::Real(x) => x.to_string(),
         Value::Boolean(b) => b.to_string(),
         Value::Text(s) => s.clone(),
+        Value::Vector(v) => {
+            let inner: Vec<String> = v.iter().map(|x| x.to_string()).collect();
+            format!("[{}]", inner.join(", "))
+        }
     }
 }
 

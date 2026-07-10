@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/storage",
     "crates/sql",
+    "crates/vector",
     "crates/engine",
     "crates/cli",
     "crates/pgwire",

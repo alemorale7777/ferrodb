@@ -9,4 +9,5 @@
 - [The cost-based optimizer](./optimizer.md)
 - [PostgreSQL wire protocol](./pgwire.md)
 - [WebAssembly playground](./wasm.md)
+- [Vector search: the HNSW index](./vectors.md)
 - [Benchmarks](./benchmarks.md)
